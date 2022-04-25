@@ -4185,9 +4185,9 @@ mod tests {
     
     #[test]
     fn honor_alias_name_case() {
-        let sql = "SELECT CASE WHEN age BETWEEN 12 AND 20 THEN 1 ELSE 0 END AS TEENAGER FROM person";
+        let sql = "SELECT CASE WHEN age BETWEEN 13 AND 19 THEN 1 ELSE 0 END AS TEENAGER FROM person";
         let expected = 
-            "Projection: CASE WHEN #person.age BETWEEN Int64(12) AND Int64(20) THEN Int64(1) ELSE Int64(0) END AS TEENAGER
+            "Projection: CASE WHEN #person.age BETWEEN Int64(13) AND Int64(19) THEN Int64(1) ELSE Int64(0) END AS TEENAGER
             \n  TableScan: person projection=None";
         quick_test(sql, expected);
     }
