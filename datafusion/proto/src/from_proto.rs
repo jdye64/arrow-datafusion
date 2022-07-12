@@ -32,7 +32,7 @@ use datafusion_common::{
 use datafusion_expr::expr::GroupingSet;
 use datafusion_expr::expr::GroupingSet::GroupingSets;
 use datafusion_expr::{
-    abs, acos, array, ascii, asin, atan, bit_length, btrim, ceil, character_length, chr,
+    abs, acos, array, ascii, asin, atan, atan2, bit_length, btrim, ceil, character_length, chr,
     coalesce, concat_expr, concat_ws_expr, cos, date_part, date_trunc, digest, exp,
     floor, left, ln, log10, log2,
     logical_plan::{PlanType, StringifiedPlan},
@@ -414,6 +414,7 @@ impl From<&protobuf::ScalarFunction> for BuiltinScalarFunction {
             ScalarFunction::Asin => Self::Asin,
             ScalarFunction::Acos => Self::Acos,
             ScalarFunction::Atan => Self::Atan,
+            ScalarFunction::Atan2 => Self::Atan2,
             ScalarFunction::Exp => Self::Exp,
             ScalarFunction::Log => Self::Log,
             ScalarFunction::Ln => Self::Ln,
@@ -1115,6 +1116,7 @@ pub fn parse_expr(
                 ScalarFunction::Cos => Ok(cos(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Tan => Ok(tan(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Atan => Ok(atan(parse_expr(&args[0], registry)?)),
+                ScalarFunction::Atan2 => Ok(atan2(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Exp => Ok(exp(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Log2 => Ok(log2(parse_expr(&args[0], registry)?)),
                 ScalarFunction::Ln => Ok(ln(parse_expr(&args[0], registry)?)),

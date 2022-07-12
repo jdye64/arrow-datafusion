@@ -230,6 +230,7 @@ pub fn return_type(
         | BuiltinScalarFunction::Acos
         | BuiltinScalarFunction::Asin
         | BuiltinScalarFunction::Atan
+        | BuiltinScalarFunction::Atan2
         | BuiltinScalarFunction::Ceil
         | BuiltinScalarFunction::Cos
         | BuiltinScalarFunction::Exp

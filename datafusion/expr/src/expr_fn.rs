@@ -291,6 +291,7 @@ unary_scalar_expr!(Tan, tan);
 unary_scalar_expr!(Asin, asin);
 unary_scalar_expr!(Acos, acos);
 unary_scalar_expr!(Atan, atan);
+unary_scalar_expr!(Atan2, atan2);
 unary_scalar_expr!(Floor, floor);
 unary_scalar_expr!(Ceil, ceil);
 unary_scalar_expr!(Now, now);
