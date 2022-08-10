@@ -152,6 +152,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         match statement {
             Statement::CreateModel {
                 model_name,
+                model_class,
             } => {
                 Ok(LogicalPlan::CreateModel(CreateModel {
                     model_name: "something".to_string(),
