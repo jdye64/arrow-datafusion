@@ -229,6 +229,7 @@ fn optimize(
         | LogicalPlan::CreateMemoryTable(_)
         | LogicalPlan::CreateView(_)
         | LogicalPlan::CreateCatalogSchema(_)
+        | LogicalPlan::CreateModel(_)
         | LogicalPlan::CreateCatalog(_)
         | LogicalPlan::DropTable(_)
         | LogicalPlan::Distinct(_)

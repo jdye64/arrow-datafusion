@@ -78,6 +78,8 @@ pub enum LogicalPlan {
     CreateExternalTable(CreateExternalTable),
     /// Creates an in memory table.
     CreateMemoryTable(CreateMemoryTable),
+    /// Creates a model instance
+    CreateModel(CreateModel),
     /// Creates a new view.
     CreateView(CreateView),
     /// Creates a new catalog schema.
@@ -106,6 +108,7 @@ impl LogicalPlan {
     /// Get a reference to the logical plan's schema
     pub fn schema(&self) -> &DFSchemaRef {
         match self {
+            LogicalPlan::CreateModel(CreateModel {schema, .. }) => schema,
             LogicalPlan::EmptyRelation(EmptyRelation { schema, .. }) => schema,
             LogicalPlan::Values(Values { schema, .. }) => schema,
             LogicalPlan::TableScan(TableScan {
@@ -143,6 +146,10 @@ impl LogicalPlan {
     /// Get a vector of references to all schemas in every node of the logical plan
     pub fn all_schemas(&self) -> Vec<&DFSchemaRef> {
         match self {
+            LogicalPlan::CreateModel(CreateModel {
+                schema,
+                ..
+            }) => vec![schema],
             LogicalPlan::TableScan(TableScan {
                 projected_schema, ..
             }) => vec![projected_schema],
@@ -248,6 +255,7 @@ impl LogicalPlan {
             | LogicalPlan::Limit(_)
             | LogicalPlan::CreateExternalTable(_)
             | LogicalPlan::CreateMemoryTable(_)
+            | LogicalPlan::CreateModel(_)
             | LogicalPlan::CreateView(_)
             | LogicalPlan::CreateCatalogSchema(_)
             | LogicalPlan::CreateCatalog(_)
@@ -293,6 +301,7 @@ impl LogicalPlan {
             | LogicalPlan::EmptyRelation { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::CreateExternalTable(_)
+            | LogicalPlan::CreateModel(_)
             | LogicalPlan::CreateCatalogSchema(_)
             | LogicalPlan::CreateCatalog(_)
             | LogicalPlan::DropTable(_) => vec![],
@@ -446,6 +455,7 @@ impl LogicalPlan {
             | LogicalPlan::EmptyRelation(_)
             | LogicalPlan::Values(_)
             | LogicalPlan::CreateExternalTable(_)
+            | LogicalPlan::CreateModel(_)
             | LogicalPlan::CreateCatalogSchema(_)
             | LogicalPlan::CreateCatalog(_)
             | LogicalPlan::DropTable(_) => true,
@@ -678,6 +688,7 @@ impl LogicalPlan {
         impl<'a> fmt::Display for Wrapper<'a> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 match self.0 {
+                    LogicalPlan::CreateModel(_) => write!(f, "CreateModel"),
                     LogicalPlan::EmptyRelation(_) => write!(f, "EmptyRelation"),
                     LogicalPlan::Values(Values { ref values, .. }) => {
                         let str_values: Vec<_> = values
@@ -1189,6 +1200,14 @@ pub struct CreateMemoryTable {
     pub if_not_exists: bool,
     /// Option to replace table content if table already exists
     pub or_replace: bool,
+}
+
+#[derive(Clone)]
+pub struct CreateModel {
+    pub model_name: String,
+    pub model_class: String,
+    // pub input: Arc<LogicalPlan>,
+    pub schema: DFSchemaRef,
 }
 
 /// Creates a view.

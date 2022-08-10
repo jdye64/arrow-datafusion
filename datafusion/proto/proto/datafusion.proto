@@ -69,6 +69,7 @@ message LogicalPlanNode {
     SubqueryAliasNode subquery_alias = 21;
     CreateViewNode create_view = 22;
     DistinctNode distinct = 23;
+    CreateModelNode create_model = 24;
   }
 }
 
@@ -153,6 +154,11 @@ message CreateExternalTableNode {
   repeated string table_partition_cols = 6;
   bool if_not_exists = 7;
   string delimiter = 8;
+}
+
+message CreateModelNode {
+  string model_name = 1;
+  string model_class = 2;
 }
 
 message CreateCatalogSchemaNode {

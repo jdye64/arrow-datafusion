@@ -37,7 +37,7 @@ use datafusion::{
 use datafusion_common::{Column, DataFusionError};
 use datafusion_expr::{
     logical_plan::{
-        Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateView,
+        Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateModel, CreateView,
         CrossJoin, Distinct, EmptyRelation, Extension, Filter, Join, JoinConstraint,
         JoinType, Limit, Projection, Repartition, Sort, SubqueryAlias, TableScan, Values,
         Window,
@@ -284,6 +284,9 @@ impl AsLogicalPlan for LogicalPlanNode {
             ))
         })?;
         match plan {
+            LogicalPlanType::CreateModel(create_model) => {
+                LogicalPlanBuilder::values(Vec::new())?.build()
+            },
             LogicalPlanType::Values(values) => {
                 let n_cols = values.n_cols as usize;
                 let values: Vec<Vec<Expr>> =
@@ -1116,6 +1119,18 @@ impl AsLogicalPlan for LogicalPlanNode {
                         catalog_name: catalog_name.clone(),
                         if_not_exists: *if_not_exists,
                         schema: Some(df_schema.into()),
+                    },
+                )),
+            }),
+            LogicalPlan::CreateModel(CreateModel {
+                model_name,
+                model_class,
+                schema
+            }) => Ok(protobuf::LogicalPlanNode {
+                logical_plan_type: Some(LogicalPlanType::CreateModel(
+                    protobuf::CreateModelNode {
+                        model_name: "something".to_string(),
+                        model_class: "Something_else".to_string(),
                     },
                 )),
             }),

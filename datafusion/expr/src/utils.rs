@@ -20,7 +20,7 @@
 use crate::expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion};
 use crate::logical_plan::builder::build_join_schema;
 use crate::logical_plan::{
-    Aggregate, Analyze, CreateMemoryTable, CreateView, Distinct, Extension, Filter, Join,
+    Aggregate, Analyze, CreateMemoryTable, CreateModel, CreateView, Distinct, Extension, Filter, Join,
     Limit, Partitioning, Projection, Repartition, Sort, Subquery, SubqueryAlias, Union,
     Values, Window,
 };
@@ -340,6 +340,11 @@ pub fn from_plan(
     inputs: &[LogicalPlan],
 ) -> Result<LogicalPlan> {
     match plan {
+        LogicalPlan::CreateModel(CreateModel {schema, model_name, model_class,}) => Ok(LogicalPlan::CreateModel(CreateModel {
+            model_name: model_name.clone(),
+            model_class: model_class.clone(),
+            schema: schema.clone(),
+        })),
         LogicalPlan::Projection(Projection { schema, alias, .. }) => {
             Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
                 expr.to_vec(),

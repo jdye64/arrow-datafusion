@@ -25,7 +25,7 @@ use datafusion_expr::expr_rewriter::normalize_col;
 use datafusion_expr::expr_rewriter::normalize_col_with_schemas;
 use datafusion_expr::logical_plan::{
     Analyze, CreateCatalog, CreateCatalogSchema,
-    CreateExternalTable as PlanCreateExternalTable, CreateMemoryTable, CreateView,
+    CreateExternalTable as PlanCreateExternalTable, CreateMemoryTable, CreateModel, CreateView,
     DropTable, Explain, FileType, JoinType, LogicalPlan, LogicalPlanBuilder, PlanType,
     ToStringifiedPlan,
 };
@@ -150,6 +150,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     pub fn sql_statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
         let sql = Some(statement.to_string());
         match statement {
+            Statement::CreateModel {
+                model_name,
+            } => {
+                Ok(LogicalPlan::CreateModel(CreateModel {
+                    model_name: "something".to_string(),
+                    model_class: "Something_else".to_string(),
+                    schema: Arc::new(DFSchema::empty()),
+                }))
+            },
             Statement::Explain {
                 verbose,
                 statement,
