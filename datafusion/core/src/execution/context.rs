@@ -2035,12 +2035,13 @@ impl FunctionRegistry for TaskContext {
 mod tests {
     use super::*;
     use crate::assert_batches_eq;
+    use crate::datasource::file_format::file_type::FileCompressionType;
     use crate::execution::context::QueryPlanner;
     use crate::execution::memory_pool::MemoryConsumer;
     use crate::execution::runtime_env::RuntimeConfig;
     use crate::physical_plan::expressions::AvgAccumulator;
     use crate::test;
-    use crate::test_util::parquet_test_data;
+    use crate::test_util::{arrow_test_data, parquet_test_data};
     use crate::variable::VarType;
     use arrow::array::ArrayRef;
     use arrow::datatypes::*;
@@ -2579,6 +2580,21 @@ mod tests {
         let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
         // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
         assert_eq!(total_rows, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_csv_compressed() -> Result<()> {
+        let ctx = SessionContext::new();
+        let csv_options = CsvReadOptions::new()
+            .file_compression_type(FileCompressionType::GZIP)
+            .has_header(true);
+        let df = ctx.read_csv(
+            format!("{}/csv/tips.csv.gz", arrow_test_data()),
+            csv_options).await?;
+        let results = df.collect().await?;
+        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
+        assert_eq!(total_rows, 244);
         Ok(())
     }
 
