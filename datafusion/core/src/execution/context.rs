@@ -25,7 +25,7 @@ use crate::{
     physical_optimizer::{
         aggregate_statistics::AggregateStatistics, join_selection::JoinSelection,
         optimizer::PhysicalOptimizerRule,
-    },
+    }, physical_plan::planner::CudfPhysicalPlanner,
 };
 pub use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::var_provider::is_system_variables;
@@ -1077,6 +1077,21 @@ impl QueryPlanner for DefaultQueryPlanner {
     }
 }
 
+struct CudfQueryPlanner {}
+
+#[async_trait]
+impl QueryPlanner for CudfQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let planner = CudfPhysicalPlanner::default();
+        planner.create_physical_plan(logical_plan, session_state)
+        .await
+    }
+}
+
 /// Map that holds opaque objects indexed by their type.
 ///
 /// Data is wrapped into an [`Arc`] to enable [`Clone`] while still being [object safe].
@@ -1505,7 +1520,7 @@ impl SessionState {
             session_id,
             optimizer: Optimizer::new(),
             physical_optimizers,
-            query_planner: Arc::new(DefaultQueryPlanner {}),
+            query_planner: Arc::new(CudfQueryPlanner {}),
             catalog_list,
             scalar_functions: HashMap::new(),
             aggregate_functions: HashMap::new(),

@@ -400,6 +400,40 @@ pub trait ExtensionPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>>;
 }
 
+#[derive(Default)]
+pub struct CudfPhysicalPlanner {
+    extension_planner: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
+
+#[async_trait]
+impl PhysicalPlanner for CudfPhysicalPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        panic!("Entering CudfPhysicalPlanner create_physical_plan");
+    }
+
+    /// Create a physical expression from a logical expression
+    /// suitable for evaluation
+    ///
+    /// `expr`: the expression to convert
+    ///
+    /// `input_dfschema`: the logical plan schema for evaluating `expr`
+    ///
+    /// `input_schema`: the physical schema for evaluating `expr`
+    fn create_physical_expr(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        input_schema: &Schema,
+        session_state: &SessionState,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        panic!("Entering CudfPhysicalPlanner create_physical_expr");
+    }
+}
+
 /// Default single node physical query planner that converts a
 /// `LogicalPlan` to an `ExecutionPlan` suitable for execution.
 #[derive(Default)]
