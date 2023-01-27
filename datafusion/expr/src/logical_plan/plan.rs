@@ -482,7 +482,7 @@ impl LogicalPlan {
 /// visitor.post_visit(Filter)
 /// visitor.post_visit(Projection)
 /// ```
-pub trait PlanVisitor {
+pub trait PlanVisitor : Sized {
     /// The type of error returned by this visitor
     type Error;
 

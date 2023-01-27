@@ -377,7 +377,7 @@ pub fn accept<V: ExecutionPlanVisitor>(
 /// visitor.post_visit(FilterExec)
 /// visitor.post_visit(ProjectionExec)
 /// ```
-pub trait ExecutionPlanVisitor {
+pub trait ExecutionPlanVisitor : Sized {
     /// The type of error returned by this visitor
     type Error;
 
