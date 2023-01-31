@@ -135,7 +135,6 @@ pub async fn from_substrait_rel(
     rel: &Rel,
     extensions: &HashMap<u32, &String>,
 ) -> Result<LogicalPlan> {
-    println!("!!!ENTERING FROM_SUBSTRAIT_REL!!!");
     match &rel.rel_type {
         Some(RelType::Project(p)) => {
             if let Some(input) = p.input.as_ref() {
@@ -385,7 +384,6 @@ pub async fn from_substrait_rel(
                         table: &nt.names[2],
                     },
                 };
-                println!("Looking for table with reference: {:?}", table_reference);
                 let t = ctx.table(table_reference).await?;
                 let t = t.into_optimized_plan()?;
                 match &read.projection {
