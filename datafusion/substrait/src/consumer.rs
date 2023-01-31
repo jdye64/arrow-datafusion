@@ -364,6 +364,7 @@ pub async fn from_substrait_rel(
         }
         Some(RelType::Read(read)) => match &read.as_ref().read_type {
             Some(ReadType::NamedTable(nt)) => {
+
                 let table_reference = match nt.names.len() {
                     0 => {
                         return Err(DataFusionError::Internal(
@@ -383,6 +384,7 @@ pub async fn from_substrait_rel(
                         table: &nt.names[2],
                     },
                 };
+                println!("Looking for table with reference: {:?}", table_reference);
                 let t = ctx.table(table_reference).await?;
                 let t = t.into_optimized_plan()?;
                 match &read.projection {
