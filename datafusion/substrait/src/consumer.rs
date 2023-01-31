@@ -135,6 +135,7 @@ pub async fn from_substrait_rel(
     rel: &Rel,
     extensions: &HashMap<u32, &String>,
 ) -> Result<LogicalPlan> {
+    println!("!!!ENTERING FROM_SUBSTRAIT_REL!!!");
     match &rel.rel_type {
         Some(RelType::Project(p)) => {
             if let Some(input) = p.input.as_ref() {
