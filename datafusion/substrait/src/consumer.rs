@@ -399,6 +399,9 @@ pub async fn from_substrait_rel(
                                 LogicalPlan::TableScan(scan) => {
                                     println!("Table Scan fetch indices: {:?}", scan.fetch);
                                     println!("Scan Projected Schema: {:?}", scan.projected_schema);
+                                    println!("Table Scan: {:?}", scan.projection);
+                                    println!("Table Scan Source Schema: {:?}", scan.source.schema());
+                                    println!("Table Name: {:?}", scan.table_name);
                                     let fields: Vec<DFField> = column_indices
                                         .iter()
                                         .map(|i| scan.projected_schema.field(*i).clone())
