@@ -386,6 +386,7 @@ pub async fn from_substrait_rel(
                 };
                 let t = ctx.table(table_reference).await?;
                 let t = t.into_optimized_plan()?;
+                println!("LogicalPlan: {:?}", t);
                 match &read.projection {
                     Some(MaskExpression { select, .. }) => match &select.as_ref() {
                         Some(projection) => {
