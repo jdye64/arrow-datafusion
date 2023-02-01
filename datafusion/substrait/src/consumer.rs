@@ -403,10 +403,18 @@ pub async fn from_substrait_rel(
                                     println!("Table Scan: {:?}", scan.projection);
                                     println!("Table Scan Source Schema: {:?}", scan.source.schema());
                                     println!("Table Name: {:?}", scan.table_name);
-                                    let fields: Vec<DFField> = column_indices
-                                        .iter()
-                                        .map(|i| scan.projected_schema.field(*i).clone())
-                                        .collect();
+                                    // Ensure the scan's projected schema is at least as large as the 
+                                    // list of desired column_indicies. Some engines produce output
+                                    // that enters this condition with scan.projected_schema being 
+                                    // empty so we want to guard against that.
+                                    let mut fields: Vec<DFField> = Vec::new();
+                                    if scan.projected_schema.fields().len() >= column_indices.len() {
+                                        fields = column_indices
+                                            .iter()
+                                            .map(|i| scan.projected_schema.field(*i).clone())
+                                            .collect();
+                                    }
+                                    
                                     // clippy thinks this clone is redundant but it is not
                                     #[allow(clippy::redundant_clone)]
                                     let mut scan = scan.clone();
