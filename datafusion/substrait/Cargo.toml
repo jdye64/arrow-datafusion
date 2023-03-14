@@ -34,7 +34,7 @@ datafusion = { version = "20.0.0", path = "../core" }
 itertools = "0.10.5"
 object_store = "0.5.4"
 prost = "0.11"
-substrait = "0.4.2"
+datafusion-python = { git = "https://github.com/jdye64/substrait-rs.git", branch = "typify_build_issues" }
 tokio = "1.17"
 
 [build-dependencies]
