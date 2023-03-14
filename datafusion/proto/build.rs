@@ -35,10 +35,14 @@ fn main() -> Result<(), String> {
 }
 
 fn build() -> Result<(), String> {
+    println!("!!! Checking for prescence of OUT_DIR");
     let out: PathBuf = std::env::var("OUT_DIR")
         .expect("Cannot find OUT_DIR environment variable")
         .into();
     let descriptor_path = out.join("proto_descriptor.bin");
+    println!("!!! Proto output path: {:?}", descriptor_path);
+    println!("!!! PROTOC: {:?}", std::env::var("PROTOC"));
+    println!("!!! CONDA_PREFIX: {:?}", std::env::var("CONDA_PREFIX"));
 
     prost_build::Config::new()
         .file_descriptor_set_path(&descriptor_path)
@@ -47,8 +51,12 @@ fn build() -> Result<(), String> {
         .compile_protos(&["proto/datafusion.proto"], &["proto"])
         .map_err(|e| format!("protobuf compilation failed: {e}"))?;
 
+    println!("!!! After prost build config");
+
     let descriptor_set = std::fs::read(&descriptor_path)
         .unwrap_or_else(|e| panic!("Cannot read {:?}: {}", &descriptor_path, e));
+
+    println!("!!! Descriptor Set: {:?}", descriptor_set);
 
     pbjson_build::Builder::new()
         .register_descriptors(&descriptor_set)
@@ -58,11 +66,15 @@ fn build() -> Result<(), String> {
         .build(&[".datafusion"])
         .map_err(|e| format!("pbjson compilation failed: {e}"))?;
 
+    println!("!!! After PBJson build");
+
     let prost = out.join("datafusion.rs");
     let pbjson = out.join("datafusion.serde.rs");
 
     std::fs::copy(prost, "src/generated/prost.rs").unwrap();
     std::fs::copy(pbjson, "src/generated/pbjson.rs").unwrap();
+
+    println!("!!! Done copying the resulting files to their target location");
 
     Ok(())
 }
