@@ -44,18 +44,15 @@ use arrow_array::types::{
     Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
     UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
+use datafusion_common::internal_err;
 use datafusion_common::ScalarValue;
 use datafusion_common::{downcast_value, DataFusionError, Result};
 use datafusion_expr::Accumulator;
 
-use crate::aggregate::row_accumulator::{
-    is_row_accumulator_support_dtype, RowAccumulator,
-};
 use crate::aggregate::utils::down_cast_any_ref;
 use crate::expressions::format_state_name;
 use arrow::array::Array;
 use arrow::array::Decimal128Array;
-use datafusion_row::accessor::RowAccessor;
 
 use super::moving_min_max;
 
@@ -172,10 +169,6 @@ impl AggregateExpr for Max {
         &self.name
     }
 
-    fn row_accumulator_supported(&self) -> bool {
-        is_row_accumulator_support_dtype(&self.data_type)
-    }
-
     fn groups_accumulator_supported(&self) -> bool {
         use DataType::*;
         matches!(
@@ -196,16 +189,6 @@ impl AggregateExpr for Max {
                 | Time64(_)
                 | Timestamp(_, _)
         )
-    }
-
-    fn create_row_accumulator(
-        &self,
-        start_index: usize,
-    ) -> Result<Box<dyn RowAccumulator>> {
-        Ok(Box::new(MaxRowAccumulator::new(
-            start_index,
-            self.data_type.clone(),
-        )))
     }
 
     fn create_groups_accumulator(&self) -> Result<Box<dyn GroupsAccumulator>> {
@@ -261,10 +244,10 @@ impl AggregateExpr for Max {
             // https://github.com/apache/arrow-datafusion/issues/6906
 
             // This is only reached if groups_accumulator_supported is out of sync
-            _ => Err(DataFusionError::Internal(format!(
+            _ => internal_err!(
                 "GroupsAccumulator not supported for max({})",
                 self.data_type
-            ))),
+            ),
         }
     }
 
@@ -401,10 +384,10 @@ macro_rules! min_max_batch {
             }
             other => {
                 // This should have been handled before
-                return Err(DataFusionError::Internal(format!(
+                return internal_err!(
                     "Min/Max accumulator not implemented for type {:?}",
                     other
-                )));
+                );
             }
         }
     }};
@@ -457,18 +440,6 @@ macro_rules! typed_min_max {
     }};
 }
 
-// min/max of two non-string scalar values.
-macro_rules! typed_min_max_v2 {
-    ($INDEX:ident, $ACC:ident, $SCALAR:expr, $TYPE:ident, $OP:ident) => {{
-        paste::item! {
-            match $SCALAR {
-                None => {}
-                Some(v) => $ACC.[<$OP _ $TYPE>]($INDEX, *v as $TYPE)
-            }
-        }
-    }};
-}
-
 // min/max of two scalar string values.
 macro_rules! typed_min_max_string {
     ($VALUE:expr, $DELTA:expr, $SCALAR:ident, $OP:ident) => {{
@@ -515,10 +486,10 @@ macro_rules! min_max {
                 if lhsp.eq(rhsp) && lhss.eq(rhss) {
                     typed_min_max!(lhsv, rhsv, Decimal128, $OP, lhsp, lhss)
                 } else {
-                    return Err(DataFusionError::Internal(format!(
+                    return internal_err!(
                     "MIN/MAX is not expected to receive scalars of incompatible types {:?}",
                     (lhs, rhs)
-                )));
+                );
                 }
             }
             (ScalarValue::Boolean(lhs), ScalarValue::Boolean(rhs)) => {
@@ -657,63 +628,10 @@ macro_rules! min_max {
                 interval_min_max!($OP, $VALUE, $DELTA)
             }
             e => {
-                return Err(DataFusionError::Internal(format!(
+                return internal_err!(
                     "MIN/MAX is not expected to receive scalars of incompatible types {:?}",
                     e
-                )))
-            }
-        })
-    }};
-}
-
-// min/max of two scalar values of the same type
-macro_rules! min_max_v2 {
-    ($INDEX:ident, $ACC:ident, $SCALAR:expr, $OP:ident) => {{
-        Ok(match $SCALAR {
-            ScalarValue::Boolean(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, bool, $OP)
-            }
-            ScalarValue::Float64(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, f64, $OP)
-            }
-            ScalarValue::Float32(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, f32, $OP)
-            }
-            ScalarValue::UInt64(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, u64, $OP)
-            }
-            ScalarValue::UInt32(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, u32, $OP)
-            }
-            ScalarValue::UInt16(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, u16, $OP)
-            }
-            ScalarValue::UInt8(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, u8, $OP)
-            }
-            ScalarValue::Int64(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, i64, $OP)
-            }
-            ScalarValue::Int32(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, i32, $OP)
-            }
-            ScalarValue::Int16(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, i16, $OP)
-            }
-            ScalarValue::Int8(rhs) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, i8, $OP)
-            }
-            ScalarValue::Decimal128(rhs, ..) => {
-                typed_min_max_v2!($INDEX, $ACC, rhs, i128, $OP)
-            }
-            ScalarValue::Null => {
-                // do nothing
-            }
-            e => {
-                return Err(DataFusionError::Internal(format!(
-                    "MIN/MAX is not expected to receive scalars of incompatible types {:?}",
-                    e
-                )))
+                )
             }
         })
     }};
@@ -724,17 +642,9 @@ pub fn min(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<ScalarValue> {
     min_max!(lhs, rhs, min)
 }
 
-pub fn min_row(index: usize, accessor: &mut RowAccessor, s: &ScalarValue) -> Result<()> {
-    min_max_v2!(index, accessor, s, min)
-}
-
 /// the maximum of two scalar values
 pub fn max(lhs: &ScalarValue, rhs: &ScalarValue) -> Result<ScalarValue> {
     min_max!(lhs, rhs, max)
-}
-
-pub fn max_row(index: usize, accessor: &mut RowAccessor, s: &ScalarValue) -> Result<()> {
-    min_max_v2!(index, accessor, s, max)
 }
 
 /// An accumulator to compute the maximum value
@@ -837,64 +747,6 @@ impl Accumulator for SlidingMaxAccumulator {
     }
 }
 
-#[derive(Debug)]
-struct MaxRowAccumulator {
-    index: usize,
-    data_type: DataType,
-}
-
-impl MaxRowAccumulator {
-    pub fn new(index: usize, data_type: DataType) -> Self {
-        Self { index, data_type }
-    }
-}
-
-impl RowAccumulator for MaxRowAccumulator {
-    fn update_batch(
-        &mut self,
-        values: &[ArrayRef],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        let values = &values[0];
-        let delta = &max_batch(values)?;
-        max_row(self.index, accessor, delta)
-    }
-
-    fn update_scalar_values(
-        &mut self,
-        values: &[ScalarValue],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        let value = &values[0];
-        max_row(self.index, accessor, value)
-    }
-
-    fn update_scalar(
-        &mut self,
-        value: &ScalarValue,
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        max_row(self.index, accessor, value)
-    }
-
-    fn merge_batch(
-        &mut self,
-        states: &[ArrayRef],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        self.update_batch(states, accessor)
-    }
-
-    fn evaluate(&self, accessor: &RowAccessor) -> Result<ScalarValue> {
-        Ok(accessor.get_as_scalar(&self.data_type, self.index))
-    }
-
-    #[inline(always)]
-    fn state_index(&self) -> usize {
-        self.index
-    }
-}
-
 /// MIN aggregate expression
 #[derive(Debug, Clone)]
 pub struct Min {
@@ -952,20 +804,6 @@ impl AggregateExpr for Min {
 
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn row_accumulator_supported(&self) -> bool {
-        is_row_accumulator_support_dtype(&self.data_type)
-    }
-
-    fn create_row_accumulator(
-        &self,
-        start_index: usize,
-    ) -> Result<Box<dyn RowAccumulator>> {
-        Ok(Box::new(MinRowAccumulator::new(
-            start_index,
-            self.data_type.clone(),
-        )))
     }
 
     fn groups_accumulator_supported(&self) -> bool {
@@ -1038,10 +876,10 @@ impl AggregateExpr for Min {
                 instantiate_min_accumulator!(self, i128, Decimal128Type)
             }
             // This is only reached if groups_accumulator_supported is out of sync
-            _ => Err(DataFusionError::Internal(format!(
+            _ => internal_err!(
                 "GroupsAccumulator not supported for min({})",
                 self.data_type
-            ))),
+            ),
         }
     }
 
@@ -1170,65 +1008,6 @@ impl Accumulator for SlidingMinAccumulator {
 
     fn size(&self) -> usize {
         std::mem::size_of_val(self) - std::mem::size_of_val(&self.min) + self.min.size()
-    }
-}
-
-#[derive(Debug)]
-struct MinRowAccumulator {
-    index: usize,
-    data_type: DataType,
-}
-
-impl MinRowAccumulator {
-    pub fn new(index: usize, data_type: DataType) -> Self {
-        Self { index, data_type }
-    }
-}
-
-impl RowAccumulator for MinRowAccumulator {
-    fn update_batch(
-        &mut self,
-        values: &[ArrayRef],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        let values = &values[0];
-        let delta = &min_batch(values)?;
-        min_row(self.index, accessor, delta)?;
-        Ok(())
-    }
-
-    fn update_scalar_values(
-        &mut self,
-        values: &[ScalarValue],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        let value = &values[0];
-        min_row(self.index, accessor, value)
-    }
-
-    fn update_scalar(
-        &mut self,
-        value: &ScalarValue,
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        min_row(self.index, accessor, value)
-    }
-
-    fn merge_batch(
-        &mut self,
-        states: &[ArrayRef],
-        accessor: &mut RowAccessor,
-    ) -> Result<()> {
-        self.update_batch(states, accessor)
-    }
-
-    fn evaluate(&self, accessor: &RowAccessor) -> Result<ScalarValue> {
-        Ok(accessor.get_as_scalar(&self.data_type, self.index))
-    }
-
-    #[inline(always)]
-    fn state_index(&self) -> usize {
-        self.index
     }
 }
 

@@ -26,22 +26,26 @@ use crate::datasource::physical_plan::{
 };
 use crate::{
     config::ConfigOptions,
+    datasource::listing::ListingTableUrl,
     error::{DataFusionError, Result},
     execution::context::TaskContext,
     physical_optimizer::pruning::PruningPredicate,
     physical_plan::{
         metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
-        ordering_equivalence_properties_helper, DisplayFormatType, ExecutionPlan,
-        Partitioning, SendableRecordBatchStream, Statistics,
+        DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+        Statistics,
     },
 };
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_expr::{
+    ordering_equivalence_properties_helper, PhysicalSortExpr,
+};
 use fmt::Debug;
+use object_store::path::Path;
 use std::any::Any;
 use std::fmt;
-use std::fs;
 use std::ops::Range;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
@@ -56,11 +60,10 @@ use log::debug;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
-use parquet::arrow::{ArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{ConvertedType, LogicalType};
 use parquet::file::{metadata::ParquetMetaData, properties::WriterProperties};
 use parquet::schema::types::ColumnDescriptor;
-use tokio::task::JoinSet;
 
 mod metrics;
 pub mod page_filter;
@@ -387,6 +390,10 @@ impl ExecutionPlan for ParquetExec {
     fn statistics(&self) -> Statistics {
         self.projected_statistics.clone()
     }
+
+    fn file_scan_config(&self) -> Option<&FileScanConfig> {
+        Some(&self.base_config)
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file
@@ -634,31 +641,35 @@ pub async fn plan_to_parquet(
     writer_properties: Option<WriterProperties>,
 ) -> Result<()> {
     let path = path.as_ref();
-    // create directory to contain the Parquet files (one per partition)
-    let fs_path = std::path::Path::new(path);
-    if let Err(e) = fs::create_dir(fs_path) {
-        return Err(DataFusionError::Execution(format!(
-            "Could not create directory {path}: {e:?}"
-        )));
-    }
-
+    let parsed = ListingTableUrl::parse(path)?;
+    let object_store_url = parsed.object_store();
+    let store = task_ctx.runtime_env().object_store(&object_store_url)?;
     let mut join_set = JoinSet::new();
     for i in 0..plan.output_partitioning().partition_count() {
-        let plan = plan.clone();
-        let filename = format!("part-{i}.parquet");
-        let path = fs_path.join(filename);
-        let file = fs::File::create(path)?;
-        let mut writer =
-            ArrowWriter::try_new(file, plan.schema(), writer_properties.clone())?;
-        let stream = plan.execute(i, task_ctx.clone())?;
-        join_set.spawn(async move {
-            stream
-                .map(|batch| writer.write(&batch?).map_err(DataFusionError::ParquetError))
-                .try_collect()
-                .await
-                .map_err(DataFusionError::from)?;
+        let plan: Arc<dyn ExecutionPlan> = plan.clone();
+        let filename = format!("{}/part-{i}.parquet", parsed.prefix());
+        let file = Path::parse(filename)?;
+        let propclone = writer_properties.clone();
 
-            writer.close().map_err(DataFusionError::from).map(|_| ())
+        let storeref = store.clone();
+        let (_, multipart_writer) = storeref.put_multipart(&file).await?;
+        let mut stream = plan.execute(i, task_ctx.clone())?;
+        join_set.spawn(async move {
+            let mut writer = AsyncArrowWriter::try_new(
+                multipart_writer,
+                plan.schema(),
+                10485760,
+                propclone,
+            )?;
+            while let Some(next_batch) = stream.next().await {
+                let batch = next_batch?;
+                writer.write(&batch).await?;
+            }
+            writer
+                .close()
+                .await
+                .map_err(DataFusionError::from)
+                .map(|_| ())
         });
     }
 
@@ -757,9 +768,10 @@ mod tests {
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
     use object_store::ObjectMeta;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::Write;
     use tempfile::TempDir;
+    use url::Url;
 
     struct RoundTripResult {
         /// Data that was read back from ParquetFiles
@@ -908,14 +920,19 @@ mod tests {
     #[tokio::test]
     async fn write_parquet_results_error_handling() -> Result<()> {
         let ctx = SessionContext::new();
+        // register a local file system object store for /tmp directory
+        let tmp_dir = TempDir::new()?;
+        let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+        let local_url = Url::parse("file://local").unwrap();
+        ctx.runtime_env().register_object_store(&local_url, local);
+
         let options = CsvReadOptions::default()
             .schema_infer_max_records(2)
             .has_header(true);
         let df = ctx.read_csv("tests/data/corrupt.csv", options).await?;
-        let tmp_dir = TempDir::new()?;
-        let out_dir = tmp_dir.as_ref().to_str().unwrap().to_string() + "/out";
+        let out_dir_url = "file://local/out";
         let e = df
-            .write_parquet(&out_dir, None)
+            .write_parquet(out_dir_url, None)
             .await
             .expect_err("should fail because input file does not match inferred schema");
         assert_eq!("Arrow error: Parser error: Error while parsing value d for column 0 at line 4", format!("{e}"));
@@ -1927,37 +1944,58 @@ mod tests {
         )
         .await?;
 
+        // register a local file system object store for /tmp directory
+        let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
+        let local_url = Url::parse("file://local").unwrap();
+        ctx.runtime_env().register_object_store(&local_url, local);
+
         // execute a simple query and write the results to parquet
         let out_dir = tmp_dir.as_ref().to_str().unwrap().to_string() + "/out";
+        let out_dir_url = "file://local/out";
         let df = ctx.sql("SELECT c1, c2 FROM test").await?;
-        df.write_parquet(&out_dir, None).await?;
+        df.write_parquet(out_dir_url, None).await?;
         // write_parquet(&mut ctx, "SELECT c1, c2 FROM test", &out_dir, None).await?;
 
-        // create a new context and verify that the results were saved to a partitioned csv file
+        // create a new context and verify that the results were saved to a partitioned parquet file
         let ctx = SessionContext::new();
+
+        // get write_id
+        let mut paths = fs::read_dir(&out_dir).unwrap();
+        let path = paths.next();
+        let name = path
+            .unwrap()?
+            .path()
+            .file_name()
+            .expect("Should be a file name")
+            .to_str()
+            .expect("Should be a str")
+            .to_owned();
+        println!("{name}");
+        let (parsed_id, _) = name.split_once('_').expect("File should contain _ !");
+        let write_id = parsed_id.to_owned();
 
         // register each partition as well as the top level dir
         ctx.register_parquet(
             "part0",
-            &format!("{out_dir}/part-0.parquet"),
+            &format!("{out_dir}/{write_id}_0.parquet"),
             ParquetReadOptions::default(),
         )
         .await?;
         ctx.register_parquet(
             "part1",
-            &format!("{out_dir}/part-1.parquet"),
+            &format!("{out_dir}/{write_id}_1.parquet"),
             ParquetReadOptions::default(),
         )
         .await?;
         ctx.register_parquet(
             "part2",
-            &format!("{out_dir}/part-2.parquet"),
+            &format!("{out_dir}/{write_id}_2.parquet"),
             ParquetReadOptions::default(),
         )
         .await?;
         ctx.register_parquet(
             "part3",
-            &format!("{out_dir}/part-3.parquet"),
+            &format!("{out_dir}/{write_id}_3.parquet"),
             ParquetReadOptions::default(),
         )
         .await?;
