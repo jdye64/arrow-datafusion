@@ -46,18 +46,24 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          # these represent dependencies downloaded by cargo
-          # and thus do not depend on the OS, arch nor rust version.
-          path: /github/home/.cargo
-          key: cargo-cache-
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
           rust-version: stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
+            ./datafusion-cli/target/
+          # this key equals the ones on `linux-build-lib` for re-use
+          key: cargo-cache-benchmark-${{ hashFiles('datafusion/**/Cargo.toml', 'benchmarks/Cargo.toml', 'datafusion-cli/Cargo.toml') }}
 
       - name: Check workspace without default features
         run: cargo check --no-default-features -p datafusion
@@ -65,7 +71,6 @@ jobs:
       - name: Check workspace in debug mode
         run: cargo check
 
-      # Note: this does not include dictionary_expressions to reduce codegen
       - name: Check workspace with all features
         run: cargo check --workspace --benches --features avro,json
       - name: Check Cargo.lock for datafusion-cli
@@ -82,21 +87,15 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
           rust-version: stable
       - name: Run tests (excluding doctests)
-        run: cargo test --lib --tests --bins --features avro,json,dictionary_expressions
+        run: cargo test --lib --tests --bins --features avro,json,backtrace
       - name: Verify Working Directory Clean
         run: git diff --exit-code
 
@@ -107,15 +106,9 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -134,7 +127,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup Rust toolchain
@@ -170,14 +163,13 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
           rust-version: stable
-      # Note: this does not include dictionary_expressions to reduce codegen
       - name: Run doctests
         run: |
           cargo test --doc --features avro,json
@@ -194,7 +186,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -206,6 +198,23 @@ jobs:
           cd datafusion-cli
           cargo doc --document-private-items --no-deps
 
+  linux-wasm-pack:
+    name: build with wasm-pack
+    runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build with wasm-pack
+        working-directory: ./datafusion/wasmtest
+        run: wasm-pack build --dev
+
   # verify that the benchmark queries return the correct results
   verify-benchmark-results:
     name: verify benchmark results (amd64)
@@ -214,15 +223,20 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Cache Cargo
         uses: actions/cache@v3
         with:
-          path: /github/home/.cargo
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ./target/
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache-benchmark-${{ hashFiles('datafusion/**/Cargo.toml', 'benchmarks/Cargo.toml') }}
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -262,7 +276,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Setup toolchain
@@ -278,7 +292,7 @@ jobs:
     name: cargo test (win64)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install protobuf compiler
@@ -302,18 +316,19 @@ jobs:
         shell: bash
         run: |
           export PATH=$PATH:$HOME/d/protoc/bin
-          cargo test --lib --tests --bins --features avro,json,dictionary_expressions
+          cargo test --lib --tests --bins --features avro,json,backtrace
           cd datafusion-cli
           cargo test --lib --tests --bins --all-features
         env:
           # do not produce debug symbols to keep memory usage down
           RUSTFLAGS: "-C debuginfo=0"
+          RUST_BACKTRACE: "1"
 
   macos:
     name: cargo test (mac)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install protobuf compiler
@@ -337,29 +352,24 @@ jobs:
       - name: Run tests (excluding doctests)
         shell: bash
         run: |
-          cargo test --lib --tests --bins --features avro,json,dictionary_expressions
+          cargo test --lib --tests --bins --features avro,json,backtrace
           cd datafusion-cli
           cargo test --lib --tests --bins --all-features
         env:
           # do not produce debug symbols to keep memory usage down
           RUSTFLAGS: "-C debuginfo=0"
+          RUST_BACKTRACE: "1"
 
   test-datafusion-pyarrow:
     name: cargo test pyarrow (amd64)
     needs: [ linux-build-lib ]
     runs-on: ubuntu-20.04
     container:
-      image: amd64/rust
+      image: amd64/rust:bullseye # Workaround https://github.com/actions/setup-python/issues/721
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - uses: actions/setup-python@v4
         with:
           python-version: "3.8"
@@ -380,7 +390,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
       - name: Run gen
@@ -395,7 +405,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -412,7 +422,7 @@ jobs:
   #   name: coverage
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@v3
+  #     - uses: actions/checkout@v4
   #       with:
   #         submodules: true
   #     - name: Install protobuf compiler
@@ -454,15 +464,9 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -480,15 +484,9 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -505,15 +503,9 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -537,15 +529,9 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Cache Cargo
-        uses: actions/cache@v3
-        with:
-          path: /github/home/.cargo
-          # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -566,7 +552,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
       - name: Install cargo-msrv
