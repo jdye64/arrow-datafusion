@@ -27,6 +27,7 @@ pub mod csv;
 pub mod file_compression_type;
 pub mod json;
 pub mod options;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod write;
 
@@ -41,7 +42,7 @@ use crate::execution::context::SessionState;
 use crate::physical_plan::{ExecutionPlan, Statistics};
 
 use datafusion_common::{not_impl_err, DataFusionError, FileType};
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
 
 use async_trait::async_trait;
 use object_store::{ObjectMeta, ObjectStore};
@@ -99,6 +100,7 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         _input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         _conf: FileSinkConfig,
+        _order_requirements: Option<Vec<PhysicalSortRequirement>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!("Writer not implemented for this format")
     }
@@ -122,7 +124,8 @@ pub(crate) mod test_util {
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
     use object_store::{
-        GetOptions, GetResult, GetResultPayload, ListResult, MultipartId,
+        GetOptions, GetResult, GetResultPayload, ListResult, MultipartId, PutOptions,
+        PutResult,
     };
     use tokio::io::AsyncWrite;
 
@@ -187,7 +190,12 @@ pub(crate) mod test_util {
 
     #[async_trait]
     impl ObjectStore for VariableStream {
-        async fn put(&self, _location: &Path, _bytes: Bytes) -> object_store::Result<()> {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: Bytes,
+            _opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
             unimplemented!()
         }
 
@@ -226,6 +234,7 @@ pub(crate) mod test_util {
                     last_modified: Default::default(),
                     size: range.end,
                     e_tag: None,
+                    version: None,
                 },
                 range: Default::default(),
             })
@@ -255,11 +264,10 @@ pub(crate) mod test_util {
             unimplemented!()
         }
 
-        async fn list(
+        fn list(
             &self,
             _prefix: Option<&Path>,
-        ) -> object_store::Result<BoxStream<'_, object_store::Result<ObjectMeta>>>
-        {
+        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
             unimplemented!()
         }
 

@@ -40,8 +40,10 @@ use datafusion_expr::Accumulator;
 pub struct DistinctSum {
     /// Column name
     name: String,
-    /// The DataType for the final sum
+    // The DataType for the input expression
     data_type: DataType,
+    // The DataType for the final sum
+    return_type: DataType,
     /// The input arguments, only contains 1 item for sum
     exprs: Vec<Arc<dyn PhysicalExpr>>,
 }
@@ -53,10 +55,11 @@ impl DistinctSum {
         name: String,
         data_type: DataType,
     ) -> Self {
-        let data_type = sum_return_type(&data_type).unwrap();
+        let return_type = sum_return_type(&data_type).unwrap();
         Self {
             name,
             data_type,
+            return_type,
             exprs,
         }
     }
@@ -68,14 +71,14 @@ impl AggregateExpr for DistinctSum {
     }
 
     fn field(&self) -> Result<Field> {
-        Ok(Field::new(&self.name, self.data_type.clone(), true))
+        Ok(Field::new(&self.name, self.return_type.clone(), true))
     }
 
     fn state_fields(&self) -> Result<Vec<Field>> {
         // State field is a List which stores items to rebuild hash set.
         Ok(vec![Field::new_list(
             format_state_name(&self.name, "sum distinct"),
-            Field::new("item", self.data_type.clone(), true),
+            Field::new("item", self.return_type.clone(), true),
             false,
         )])
     }
@@ -159,17 +162,18 @@ impl<T: ArrowPrimitiveType> Accumulator for DistinctSumAccumulator<T> {
         // 1. Stores aggregate state in `ScalarValue::List`
         // 2. Constructs `ScalarValue::List` state from distinct numeric stored in hash set
         let state_out = {
-            let mut distinct_values = Vec::new();
-            self.values.iter().for_each(|distinct_value| {
-                distinct_values.push(ScalarValue::new_primitive::<T>(
-                    Some(distinct_value.0),
-                    &self.data_type,
-                ))
-            });
-            vec![ScalarValue::new_list(
-                Some(distinct_values),
-                self.data_type.clone(),
-            )]
+            let distinct_values = self
+                .values
+                .iter()
+                .map(|value| {
+                    ScalarValue::new_primitive::<T>(Some(value.0), &self.data_type)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            vec![ScalarValue::List(ScalarValue::new_list(
+                &distinct_values,
+                &self.data_type,
+            ))]
         };
         Ok(state_out)
     }
@@ -206,7 +210,7 @@ impl<T: ArrowPrimitiveType> Accumulator for DistinctSumAccumulator<T> {
             acc = acc.add_wrapping(distinct_value.0)
         }
         let v = (!self.values.is_empty()).then_some(acc);
-        Ok(ScalarValue::new_primitive::<T>(v, &self.data_type))
+        ScalarValue::new_primitive::<T>(v, &self.data_type)
     }
 
     fn size(&self) -> usize {

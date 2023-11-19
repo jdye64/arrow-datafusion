@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::fmt::Debug;
+use std::str::FromStr;
+use std::sync::Arc;
+
 use crate::common::{byte_to_string, proto_error, str_to_byte};
 use crate::protobuf::logical_plan_node::LogicalPlanType::CustomScan;
 use crate::protobuf::{CustomTableScanNode, LogicalExprNodeCollection};
@@ -25,12 +29,13 @@ use crate::{
         logical_plan_node::LogicalPlanType, LogicalExtensionNode, LogicalPlanNode,
     },
 };
+
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+#[cfg(feature = "parquet")]
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::{
     datasource::{
-        file_format::{
-            avro::AvroFormat, csv::CsvFormat, parquet::ParquetFormat, FileFormat,
-        },
+        file_format::{avro::AvroFormat, csv::CsvFormat, FileFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
         view::ViewTable,
         TableProvider,
@@ -38,40 +43,36 @@ use datafusion::{
     datasource::{provider_as_source, source_as_provider},
     prelude::SessionContext,
 };
-use datafusion_common::not_impl_err;
+use datafusion_common::plan_datafusion_err;
 use datafusion_common::{
-    context, internal_err, parsers::CompressionTypeVariant, DataFusionError,
-    OwnedTableReference, Result,
+    context, internal_err, not_impl_err, parsers::CompressionTypeVariant,
+    DataFusionError, OwnedTableReference, Result,
 };
-use datafusion_expr::logical_plan::DdlStatement;
-use datafusion_expr::DropView;
 use datafusion_expr::{
     logical_plan::{
         builder::project, Aggregate, CreateCatalog, CreateCatalogSchema,
-        CreateExternalTable, CreateView, CrossJoin, Distinct, EmptyRelation, Extension,
-        Join, JoinConstraint, Limit, Prepare, Projection, Repartition, Sort,
-        SubqueryAlias, TableScan, Values, Window,
+        CreateExternalTable, CreateView, CrossJoin, DdlStatement, Distinct,
+        EmptyRelation, Extension, Join, JoinConstraint, Limit, Prepare, Projection,
+        Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
     },
-    Expr, LogicalPlan, LogicalPlanBuilder,
+    DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder,
 };
+
 use prost::bytes::BufMut;
 use prost::Message;
-use std::fmt::Debug;
-use std::str::FromStr;
-use std::sync::Arc;
 
 pub mod from_proto;
 pub mod to_proto;
 
 impl From<from_proto::Error> for DataFusionError {
     fn from(e: from_proto::Error) -> Self {
-        DataFusionError::Plan(e.to_string())
+        plan_datafusion_err!("{}", e)
     }
 }
 
 impl From<to_proto::Error> for DataFusionError {
     fn from(e: to_proto::Error) -> Self {
-        DataFusionError::Plan(e.to_string())
+        plan_datafusion_err!("{}", e)
     }
 }
 
@@ -335,6 +336,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             "logical_plan::from_proto() Unsupported file format '{self:?}'"
                         ))
                     })? {
+                        #[cfg(feature = "parquet")]
                         &FileFormatType::Parquet(protobuf::ParquetFormat {}) => {
                             Arc::new(ParquetFormat::default())
                         }
@@ -362,7 +364,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let options = ListingOptions::new(file_format)
-                    .with_file_extension(scan.file_extension.clone())
+                    .with_file_extension(&scan.file_extension)
                     .with_table_partition_cols(
                         scan.table_partition_cols
                             .iter()
@@ -457,7 +459,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let input: LogicalPlan =
                     into_logical_plan!(repartition.input, ctx, extension_codec)?;
                 use protobuf::repartition_node::PartitionMethod;
-                let pb_partition_method = repartition.partition_method.clone().ok_or_else(|| {
+                let pb_partition_method = repartition.partition_method.as_ref().ok_or_else(|| {
                     DataFusionError::Internal(String::from(
                         "Protobuf deserialization error, RepartitionNode was missing required field 'partition_method'",
                     ))
@@ -472,10 +474,10 @@ impl AsLogicalPlan for LogicalPlanNode {
                             .iter()
                             .map(|expr| from_proto::parse_expr(expr, ctx))
                             .collect::<Result<Vec<_>, _>>()?,
-                        partition_count as usize,
+                        *partition_count as usize,
                     ),
                     PartitionMethod::RoundRobin(partition_count) => {
-                        Partitioning::RoundRobinBatch(partition_count as usize)
+                        Partitioning::RoundRobinBatch(*partition_count as usize)
                     }
                 };
 
@@ -493,6 +495,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))
                 })?;
 
+                let constraints = (create_extern_table.constraints.clone()).ok_or_else(|| {
+                    DataFusionError::Internal(String::from(
+                        "Protobuf deserialization error, CreateExternalTableNode was missing required table constraints.",
+                    ))
+                })?;
                 let definition = if !create_extern_table.definition.is_empty() {
                     Some(create_extern_table.definition.clone())
                 } else {
@@ -532,6 +539,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     definition,
                     unbounded: create_extern_table.unbounded,
                     options: create_extern_table.options.clone(),
+                    constraints: constraints.into(),
                 })))
             }
             LogicalPlanType::CreateView(create_view) => {
@@ -726,6 +734,33 @@ impl AsLogicalPlan for LogicalPlanNode {
                     into_logical_plan!(distinct.input, ctx, extension_codec)?;
                 LogicalPlanBuilder::from(input).distinct()?.build()
             }
+            LogicalPlanType::DistinctOn(distinct_on) => {
+                let input: LogicalPlan =
+                    into_logical_plan!(distinct_on.input, ctx, extension_codec)?;
+                let on_expr = distinct_on
+                    .on_expr
+                    .iter()
+                    .map(|expr| from_proto::parse_expr(expr, ctx))
+                    .collect::<Result<Vec<Expr>, _>>()?;
+                let select_expr = distinct_on
+                    .select_expr
+                    .iter()
+                    .map(|expr| from_proto::parse_expr(expr, ctx))
+                    .collect::<Result<Vec<Expr>, _>>()?;
+                let sort_expr = match distinct_on.sort_expr.len() {
+                    0 => None,
+                    _ => Some(
+                        distinct_on
+                            .sort_expr
+                            .iter()
+                            .map(|expr| from_proto::parse_expr(expr, ctx))
+                            .collect::<Result<Vec<Expr>, _>>()?,
+                    ),
+                };
+                LogicalPlanBuilder::from(input)
+                    .distinct_on(on_expr, select_expr, sort_expr)?
+                    .build()
+            }
             LogicalPlanType::ViewScan(scan) => {
                 let schema: Schema = convert_required!(scan.schema)?;
 
@@ -842,28 +877,49 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 if let Some(listing_table) = source.downcast_ref::<ListingTable>() {
                     let any = listing_table.options().format.as_any();
-                    let file_format_type = if any.is::<ParquetFormat>() {
-                        FileFormatType::Parquet(protobuf::ParquetFormat {})
-                    } else if let Some(csv) = any.downcast_ref::<CsvFormat>() {
-                        FileFormatType::Csv(protobuf::CsvFormat {
-                            delimiter: byte_to_string(csv.delimiter(), "delimiter")?,
-                            has_header: csv.has_header(),
-                            quote: byte_to_string(csv.quote(), "quote")?,
-                            optional_escape: if let Some(escape) = csv.escape() {
-                                Some(protobuf::csv_format::OptionalEscape::Escape(
-                                    byte_to_string(escape, "escape")?,
-                                ))
-                            } else {
-                                None
-                            },
-                        })
-                    } else if any.is::<AvroFormat>() {
-                        FileFormatType::Avro(protobuf::AvroFormat {})
-                    } else {
-                        return Err(proto_error(format!(
+                    let file_format_type = {
+                        let mut maybe_some_type = None;
+
+                        #[cfg(feature = "parquet")]
+                        if any.is::<ParquetFormat>() {
+                            maybe_some_type =
+                                Some(FileFormatType::Parquet(protobuf::ParquetFormat {}))
+                        };
+
+                        if let Some(csv) = any.downcast_ref::<CsvFormat>() {
+                            maybe_some_type =
+                                Some(FileFormatType::Csv(protobuf::CsvFormat {
+                                    delimiter: byte_to_string(
+                                        csv.delimiter(),
+                                        "delimiter",
+                                    )?,
+                                    has_header: csv.has_header(),
+                                    quote: byte_to_string(csv.quote(), "quote")?,
+                                    optional_escape: if let Some(escape) = csv.escape() {
+                                        Some(
+                                            protobuf::csv_format::OptionalEscape::Escape(
+                                                byte_to_string(escape, "escape")?,
+                                            ),
+                                        )
+                                    } else {
+                                        None
+                                    },
+                                }))
+                        }
+
+                        if any.is::<AvroFormat>() {
+                            maybe_some_type =
+                                Some(FileFormatType::Avro(protobuf::AvroFormat {}))
+                        }
+
+                        if let Some(file_format_type) = maybe_some_type {
+                            file_format_type
+                        } else {
+                            return Err(proto_error(format!(
                             "Error converting file format, {:?} is invalid as a datafusion format.",
                             listing_table.options().format
                         )));
+                        }
                     };
 
                     let options = listing_table.options();
@@ -976,7 +1032,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     ))),
                 })
             }
-            LogicalPlan::Distinct(Distinct { input }) => {
+            LogicalPlan::Distinct(Distinct::All(input)) => {
                 let input: protobuf::LogicalPlanNode =
                     protobuf::LogicalPlanNode::try_from_logical_plan(
                         input.as_ref(),
@@ -985,6 +1041,42 @@ impl AsLogicalPlan for LogicalPlanNode {
                 Ok(protobuf::LogicalPlanNode {
                     logical_plan_type: Some(LogicalPlanType::Distinct(Box::new(
                         protobuf::DistinctNode {
+                            input: Some(Box::new(input)),
+                        },
+                    ))),
+                })
+            }
+            LogicalPlan::Distinct(Distinct::On(DistinctOn {
+                on_expr,
+                select_expr,
+                sort_expr,
+                input,
+                ..
+            })) => {
+                let input: protobuf::LogicalPlanNode =
+                    protobuf::LogicalPlanNode::try_from_logical_plan(
+                        input.as_ref(),
+                        extension_codec,
+                    )?;
+                let sort_expr = match sort_expr {
+                    None => vec![],
+                    Some(sort_expr) => sort_expr
+                        .iter()
+                        .map(|expr| expr.try_into())
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                Ok(protobuf::LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::DistinctOn(Box::new(
+                        protobuf::DistinctOnNode {
+                            on_expr: on_expr
+                                .iter()
+                                .map(|expr| expr.try_into())
+                                .collect::<Result<Vec<_>, _>>()?,
+                            select_expr: select_expr
+                                .iter()
+                                .map(|expr| expr.try_into())
+                                .collect::<Result<Vec<_>, _>>()?,
+                            sort_expr,
                             input: Some(Box::new(input)),
                         },
                     ))),
@@ -1205,6 +1297,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     order_exprs,
                     unbounded,
                     options,
+                    constraints,
                 },
             )) => {
                 let mut converted_order_exprs: Vec<LogicalExprNodeCollection> = vec![];
@@ -1235,6 +1328,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             file_compression_type: file_compression_type.to_string(),
                             unbounded: *unbounded,
                             options: options.clone(),
+                            constraints: Some(constraints.clone().into()),
                         },
                     )),
                 })

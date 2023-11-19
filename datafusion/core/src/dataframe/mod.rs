@@ -17,6 +17,9 @@
 
 //! [`DataFrame`] API for building and executing query plans.
 
+#[cfg(feature = "parquet")]
+mod parquet;
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -27,15 +30,11 @@ use arrow::datatypes::{DataType, Field};
 use async_trait::async_trait;
 use datafusion_common::file_options::csv_writer::CsvWriterOptions;
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
-use datafusion_common::file_options::parquet_writer::{
-    default_builder, ParquetWriterOptions,
-};
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{
     DataFusionError, FileType, FileTypeWriterOptions, SchemaError, UnnestOptions,
 };
 use datafusion_expr::dml::CopyOptions;
-use parquet::file::properties::WriterProperties;
 
 use datafusion_common::{Column, DFSchema, ScalarValue};
 use datafusion_expr::{
@@ -582,12 +581,21 @@ impl DataFrame {
         Ok(DataFrame::new(self.session_state, plan))
     }
 
-    /// Join this DataFrame with another DataFrame using the specified columns as join keys.
+    /// Join this `DataFrame` with another `DataFrame` using explicitly specified
+    /// columns and an optional filter expression.
     ///
-    /// Filter expression expected to contain non-equality predicates that can not be pushed
-    /// down to any of join inputs.
-    /// In case of outer join, filter applied to only matched rows.
+    /// See [`join_on`](Self::join_on) for a more concise way to specify the
+    /// join condition. Since DataFusion will automatically identify and
+    /// optimize equality predicates there is no performance difference between
+    /// this function and `join_on`
     ///
+    /// `left_cols` and `right_cols` are used to form "equijoin" predicates (see
+    /// example below), which are then combined with the optional `filter`
+    /// expression.
+    ///
+    /// Note that in case of outer join, the `filter` is applied to only matched rows.
+    ///
+    /// # Example
     /// ```
     /// # use datafusion::prelude::*;
     /// # use datafusion::error::Result;
@@ -600,11 +608,14 @@ impl DataFrame {
     ///     col("a").alias("a2"),
     ///     col("b").alias("b2"),
     ///     col("c").alias("c2")])?;
+    /// // Perform the equivalent of `left INNER JOIN right ON (a = a2 AND b = b2)`
+    /// // finding all pairs of rows from `left` and `right` where `a = a2` and `b = b2`.
     /// let join = left.join(right, JoinType::Inner, &["a", "b"], &["a2", "b2"], None)?;
     /// let batches = join.collect().await?;
     /// # Ok(())
     /// # }
     /// ```
+    ///
     pub fn join(
         self,
         right: DataFrame,
@@ -624,10 +635,13 @@ impl DataFrame {
         Ok(DataFrame::new(self.session_state, plan))
     }
 
-    /// Join this DataFrame with another DataFrame using the specified expressions.
+    /// Join this `DataFrame` with another `DataFrame` using the specified
+    /// expressions.
     ///
-    /// Simply a thin wrapper over [`join`](Self::join) where the join keys are not provided,
-    /// and the provided expressions are AND'ed together to form the filter expression.
+    /// Note that DataFusion automatically optimizes joins, including
+    /// identifying and optimizing equality predicates.
+    ///
+    /// # Example
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -646,6 +660,10 @@ impl DataFrame {
     ///         col("b").alias("b2"),
     ///         col("c").alias("c2"),
     ///     ])?;
+    ///
+    /// // Perform the equivalent of `left INNER JOIN right ON (a != a2 AND b != b2)`
+    /// // finding all pairs of rows from `left` and `right` where
+    /// // where `a != a2` and `b != b2`.
     /// let join_on = left.join_on(
     ///     right,
     ///     JoinType::Inner,
@@ -663,12 +681,7 @@ impl DataFrame {
     ) -> Result<DataFrame> {
         let expr = on_exprs.into_iter().reduce(Expr::and);
         let plan = LogicalPlanBuilder::from(self.plan)
-            .join(
-                right.plan,
-                join_type,
-                (Vec::<Column>::new(), Vec::<Column>::new()),
-                expr,
-            )?
+            .join_on(right.plan, join_type, expr)?
             .build()?;
         Ok(DataFrame::new(self.session_state, plan))
     }
@@ -1053,40 +1066,6 @@ impl DataFrame {
         DataFrame::new(self.session_state, plan).collect().await
     }
 
-    /// Write a `DataFrame` to a Parquet file.
-    pub async fn write_parquet(
-        self,
-        path: &str,
-        options: DataFrameWriteOptions,
-        writer_properties: Option<WriterProperties>,
-    ) -> Result<Vec<RecordBatch>, DataFusionError> {
-        if options.overwrite {
-            return Err(DataFusionError::NotImplemented(
-                "Overwrites are not implemented for DataFrame::write_parquet.".to_owned(),
-            ));
-        }
-        match options.compression{
-            CompressionTypeVariant::UNCOMPRESSED => (),
-            _ => return Err(DataFusionError::Configuration("DataFrame::write_parquet method does not support compression set via DataFrameWriteOptions. Set parquet compression via writer_properties instead.".to_owned()))
-        }
-        let props = match writer_properties {
-            Some(props) => props,
-            None => default_builder(self.session_state.config_options())?.build(),
-        };
-        let file_type_writer_options =
-            FileTypeWriterOptions::Parquet(ParquetWriterOptions::new(props));
-        let copy_options = CopyOptions::WriterOptions(Box::new(file_type_writer_options));
-        let plan = LogicalPlanBuilder::copy_to(
-            self.plan,
-            path.into(),
-            FileType::PARQUET,
-            options.single_file_output,
-            copy_options,
-        )?
-        .build()?;
-        DataFrame::new(self.session_state, plan).collect().await
-    }
-
     /// Executes a query and writes the results to a partitioned JSON file.
     pub async fn write_json(
         self,
@@ -1144,10 +1123,7 @@ impl DataFrame {
                     col_exists = true;
                     new_column.clone()
                 } else {
-                    Expr::Column(Column {
-                        relation: None,
-                        name: f.name().into(),
-                    })
+                    col(f.qualified_column())
                 }
             })
             .collect();
@@ -1218,7 +1194,42 @@ impl DataFrame {
         Ok(DataFrame::new(self.session_state, project_plan))
     }
 
-    /// Convert a prepare logical plan into its inner logical plan with all params replaced with their corresponding values
+    /// Replace all parameters in logical plan with the specified
+    /// values, in preparation for execution.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use datafusion::prelude::*;
+    /// # use datafusion::{error::Result, assert_batches_eq};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// # use datafusion_common::ScalarValue;
+    /// let mut ctx = SessionContext::new();
+    /// # ctx.register_csv("example", "tests/data/example.csv", CsvReadOptions::new()).await?;
+    /// let results = ctx
+    ///   .sql("SELECT a FROM example WHERE b = $1")
+    ///   .await?
+    ///    // replace $1 with value 2
+    ///   .with_param_values(vec![
+    ///      // value at index 0 --> $1
+    ///      ScalarValue::from(2i64)
+    ///    ])?
+    ///   .collect()
+    ///   .await?;
+    /// assert_batches_eq!(
+    ///  &[
+    ///    "+---+",
+    ///    "| a |",
+    ///    "+---+",
+    ///    "| 1 |",
+    ///    "+---+",
+    ///  ],
+    ///  &results
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_param_values(self, param_values: Vec<ScalarValue>) -> Result<Self> {
         let plan = self.plan.with_param_values(param_values)?;
         Ok(Self::new(self.session_state, plan))
@@ -1238,7 +1249,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub async fn cache(self) -> Result<DataFrame> {
-        let context = SessionContext::with_state(self.session_state.clone());
+        let context = SessionContext::new_with_state(self.session_state.clone());
         let mem_table = MemTable::try_new(
             SchemaRef::from(self.schema().clone()),
             self.collect_partitioned().await?,
@@ -1319,22 +1330,101 @@ mod tests {
         WindowFunction,
     };
     use datafusion_physical_expr::expressions::Column;
-    use object_store::local::LocalFileSystem;
-    use parquet::basic::{BrotliLevel, GzipLevel, ZstdLevel};
-    use parquet::file::reader::FileReader;
-    use tempfile::TempDir;
-    use url::Url;
 
     use crate::execution::context::SessionConfig;
-    use crate::execution::options::{CsvReadOptions, ParquetReadOptions};
     use crate::physical_plan::ColumnarValue;
     use crate::physical_plan::Partitioning;
     use crate::physical_plan::PhysicalExpr;
-    use crate::test_util;
-    use crate::test_util::parquet_test_data;
+    use crate::test_util::{register_aggregate_csv, test_table, test_table_with_name};
     use crate::{assert_batches_sorted_eq, execution::context::SessionContext};
 
     use super::*;
+
+    async fn assert_logical_expr_schema_eq_physical_expr_schema(
+        df: DataFrame,
+    ) -> Result<()> {
+        let logical_expr_dfschema = df.schema();
+        let logical_expr_schema = SchemaRef::from(logical_expr_dfschema.to_owned());
+        let batches = df.collect().await?;
+        let physical_expr_schema = batches[0].schema();
+        assert_eq!(logical_expr_schema, physical_expr_schema);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_array_agg_ord_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let create_table_query = r#"
+            CREATE TABLE test_table (
+                "double_field" DOUBLE,
+                "string_field" VARCHAR
+            ) AS VALUES
+                (1.0, 'a'),
+                (2.0, 'b'),
+                (3.0, 'c')
+        "#;
+        ctx.sql(create_table_query).await?;
+
+        let query = r#"SELECT
+        array_agg("double_field" ORDER BY "string_field") as "double_field",
+        array_agg("string_field" ORDER BY "string_field") as "string_field"
+    FROM test_table"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_array_agg_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let create_table_query = r#"
+            CREATE TABLE test_table (
+                "double_field" DOUBLE,
+                "string_field" VARCHAR
+            ) AS VALUES
+                (1.0, 'a'),
+                (2.0, 'b'),
+                (3.0, 'c')
+        "#;
+        ctx.sql(create_table_query).await?;
+
+        let query = r#"SELECT
+        array_agg("double_field") as "double_field",
+        array_agg("string_field") as "string_field"
+    FROM test_table"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_array_agg_distinct_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        let create_table_query = r#"
+            CREATE TABLE test_table (
+                "double_field" DOUBLE,
+                "string_field" VARCHAR
+            ) AS VALUES
+                (1.0, 'a'),
+                (2.0, 'b'),
+                (2.0, 'a')
+        "#;
+        ctx.sql(create_table_query).await?;
+
+        let query = r#"SELECT
+        array_agg(distinct "double_field") as "double_field",
+        array_agg(distinct "string_field") as "string_field"
+    FROM test_table"#;
+
+        let result = ctx.sql(query).await?;
+        assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn select_columns() -> Result<()> {
@@ -1752,31 +1842,6 @@ mod tests {
         Ok(ctx.sql(sql).await?.into_unoptimized_plan())
     }
 
-    async fn test_table_with_name(name: &str) -> Result<DataFrame> {
-        let mut ctx = SessionContext::new();
-        register_aggregate_csv(&mut ctx, name).await?;
-        ctx.table(name).await
-    }
-
-    async fn test_table() -> Result<DataFrame> {
-        test_table_with_name("aggregate_test_100").await
-    }
-
-    async fn register_aggregate_csv(
-        ctx: &mut SessionContext,
-        table_name: &str,
-    ) -> Result<()> {
-        let schema = test_util::aggr_test_schema();
-        let testdata = test_util::arrow_test_data();
-        ctx.register_csv(
-            table_name,
-            &format!("{testdata}/csv/aggregate_test_100.csv"),
-            CsvReadOptions::new().schema(schema.as_ref()),
-        )
-        .await?;
-        Ok(())
-    }
-
     #[tokio::test]
     async fn with_column() -> Result<()> {
         let df = test_table().await?.select_columns(&["c1", "c2", "c3"])?;
@@ -1851,6 +1916,131 @@ mod tests {
             ],
             &df_results_overwrite_self
         );
+
+        Ok(())
+    }
+
+    // Test issue: https://github.com/apache/arrow-datafusion/issues/7790
+    // The join operation outputs two identical column names, but they belong to different relations.
+    #[tokio::test]
+    async fn with_column_join_same_columns() -> Result<()> {
+        let df = test_table().await?.select_columns(&["c1"])?;
+        let ctx = SessionContext::new();
+
+        let table = df.into_view();
+        ctx.register_table("t1", table.clone())?;
+        ctx.register_table("t2", table)?;
+        let df = ctx
+            .table("t1")
+            .await?
+            .join(
+                ctx.table("t2").await?,
+                JoinType::Inner,
+                &["c1"],
+                &["c1"],
+                None,
+            )?
+            .sort(vec![
+                // make the test deterministic
+                col("t1.c1").sort(true, true),
+            ])?
+            .limit(0, Some(1))?;
+
+        let df_results = df.clone().collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+",
+                "| c1 | c1 |",
+                "+----+----+",
+                "| a  | a  |",
+                "+----+----+",
+            ],
+            &df_results
+        );
+
+        let df_with_column = df.clone().with_column("new_column", lit(true))?;
+
+        assert_eq!(
+            "\
+        Projection: t1.c1, t2.c1, Boolean(true) AS new_column\
+        \n  Limit: skip=0, fetch=1\
+        \n    Sort: t1.c1 ASC NULLS FIRST\
+        \n      Inner Join: t1.c1 = t2.c1\
+        \n        TableScan: t1\
+        \n        TableScan: t2",
+            format!("{:?}", df_with_column.logical_plan())
+        );
+
+        assert_eq!(
+            "\
+        Projection: t1.c1, t2.c1, Boolean(true) AS new_column\
+        \n  Limit: skip=0, fetch=1\
+        \n    Sort: t1.c1 ASC NULLS FIRST, fetch=1\
+        \n      Inner Join: t1.c1 = t2.c1\
+        \n        SubqueryAlias: t1\
+        \n          TableScan: aggregate_test_100 projection=[c1]\
+        \n        SubqueryAlias: t2\
+        \n          TableScan: aggregate_test_100 projection=[c1]",
+            format!("{:?}", df_with_column.clone().into_optimized_plan()?)
+        );
+
+        let df_results = df_with_column.collect().await?;
+
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+------------+",
+                "| c1 | c1 | new_column |",
+                "+----+----+------------+",
+                "| a  | a  | true       |",
+                "+----+----+------------+",
+            ],
+            &df_results
+        );
+        Ok(())
+    }
+
+    // Table 't1' self join
+    // Supplementary test of issue: https://github.com/apache/arrow-datafusion/issues/7790
+    #[tokio::test]
+    async fn with_column_self_join() -> Result<()> {
+        let df = test_table().await?.select_columns(&["c1"])?;
+        let ctx = SessionContext::new();
+
+        ctx.register_table("t1", df.into_view())?;
+
+        let df = ctx
+            .table("t1")
+            .await?
+            .join(
+                ctx.table("t1").await?,
+                JoinType::Inner,
+                &["c1"],
+                &["c1"],
+                None,
+            )?
+            .sort(vec![
+                // make the test deterministic
+                col("t1.c1").sort(true, true),
+            ])?
+            .limit(0, Some(1))?;
+
+        let df_results = df.clone().collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+",
+                "| c1 | c1 |",
+                "+----+----+",
+                "| a  | a  |",
+                "+----+----+",
+            ],
+            &df_results
+        );
+
+        let actual_err = df.clone().with_column("new_column", lit(true)).unwrap_err();
+        let expected_err = "Error during planning: Projections require unique expression names \
+            but the expression \"t1.c1\" at position 0 and \"t1.c1\" at position 1 have the same name. \
+            Consider aliasing (\"AS\") one of them.";
+        assert_eq!(actual_err.strip_backtrace(), expected_err);
 
         Ok(())
     }
@@ -2011,7 +2201,7 @@ mod tests {
                 "datafusion.sql_parser.enable_ident_normalization".to_owned(),
                 "false".to_owned(),
             )]))?;
-        let mut ctx = SessionContext::with_config(config);
+        let mut ctx = SessionContext::new_with_config(config);
         let name = "aggregate_test_100";
         register_aggregate_csv(&mut ctx, name).await?;
         let df = ctx.table(name);
@@ -2052,33 +2242,6 @@ mod tests {
             ["+----+", "| c1 |", "+----+", "| a  |", "+----+"],
             &df_renamed
         );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn filter_pushdown_dataframe() -> Result<()> {
-        let ctx = SessionContext::new();
-
-        ctx.register_parquet(
-            "test",
-            &format!("{}/alltypes_plain.snappy.parquet", parquet_test_data()),
-            ParquetReadOptions::default(),
-        )
-        .await?;
-
-        ctx.register_table("t1", ctx.table("test").await?.into_view())?;
-
-        let df = ctx
-            .table("t1")
-            .await?
-            .filter(col("id").eq(lit(1)))?
-            .select_columns(&["bool_col", "int_col"])?;
-
-        let plan = df.explain(false, false)?.collect().await?;
-        // Filters all the way to Parquet
-        let formatted = pretty::pretty_format_batches(&plan)?.to_string();
-        assert!(formatted.contains("FilterExec: id@0 = 1"));
 
         Ok(())
     }
@@ -2363,55 +2526,6 @@ mod tests {
                     Partitioning::UnknownPartitioning(partition_count) if partition_count == default_partition_count));
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn write_parquet_with_compression() -> Result<()> {
-        let test_df = test_table().await?;
-
-        let output_path = "file://local/test.parquet";
-        let test_compressions = vec![
-            parquet::basic::Compression::SNAPPY,
-            parquet::basic::Compression::LZ4,
-            parquet::basic::Compression::LZ4_RAW,
-            parquet::basic::Compression::GZIP(GzipLevel::default()),
-            parquet::basic::Compression::BROTLI(BrotliLevel::default()),
-            parquet::basic::Compression::ZSTD(ZstdLevel::default()),
-        ];
-        for compression in test_compressions.into_iter() {
-            let df = test_df.clone();
-            let tmp_dir = TempDir::new()?;
-            let local = Arc::new(LocalFileSystem::new_with_prefix(&tmp_dir)?);
-            let local_url = Url::parse("file://local").unwrap();
-            let ctx = &test_df.session_state;
-            ctx.runtime_env().register_object_store(&local_url, local);
-            df.write_parquet(
-                output_path,
-                DataFrameWriteOptions::new().with_single_file_output(true),
-                Some(
-                    WriterProperties::builder()
-                        .set_compression(compression)
-                        .build(),
-                ),
-            )
-            .await?;
-
-            // Check that file actually used the specified compression
-            let file = std::fs::File::open(tmp_dir.into_path().join("test.parquet"))?;
-
-            let reader =
-                parquet::file::serialized_reader::SerializedFileReader::new(file)
-                    .unwrap();
-
-            let parquet_metadata = reader.metadata();
-
-            let written_compression =
-                parquet_metadata.row_group(0).column(0).compression();
-
-            assert_eq!(written_compression, compression);
         }
 
         Ok(())

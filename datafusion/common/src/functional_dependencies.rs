@@ -18,11 +18,15 @@
 //! FunctionalDependencies keeps track of functional dependencies
 //! inside DFSchema.
 
-use crate::{DFSchema, DFSchemaRef, DataFusionError, JoinType, Result};
-use sqlparser::ast::TableConstraint;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::ops::Deref;
+use std::vec::IntoIter;
+
+use crate::error::_plan_err;
+use crate::{DFSchema, DFSchemaRef, DataFusionError, JoinType, Result};
+
+use sqlparser::ast::TableConstraint;
 
 /// This object defines a constraint on a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,13 +47,15 @@ pub struct Constraints {
 impl Constraints {
     /// Create empty constraints
     pub fn empty() -> Self {
-        Constraints::new(vec![])
+        Constraints::new_unverified(vec![])
     }
 
-    // This method is private.
-    // Outside callers can either create empty constraint using `Constraints::empty` API.
-    // or create constraint from table constraints using `Constraints::new_from_table_constraints` API.
-    fn new(constraints: Vec<Constraint>) -> Self {
+    /// Create a new `Constraints` object from the given `constraints`.
+    /// Users should use the `empty` or `new_from_table_constraints` functions
+    /// for constructing `Constraints`. This constructor is for internal
+    /// purposes only and does not check whether the argument is valid. The user
+    /// is responsible for supplying a valid vector of `Constraint` objects.
+    pub fn new_unverified(constraints: Vec<Constraint>) -> Self {
         Self { inner: constraints }
     }
 
@@ -90,26 +96,35 @@ impl Constraints {
                         Constraint::Unique(indices)
                     })
                 }
-                TableConstraint::ForeignKey { .. } => Err(DataFusionError::Plan(
-                    "Foreign key constraints are not currently supported".to_string(),
-                )),
-                TableConstraint::Check { .. } => Err(DataFusionError::Plan(
-                    "Check constraints are not currently supported".to_string(),
-                )),
-                TableConstraint::Index { .. } => Err(DataFusionError::Plan(
-                    "Indexes are not currently supported".to_string(),
-                )),
-                TableConstraint::FulltextOrSpatial { .. } => Err(DataFusionError::Plan(
-                    "Indexes are not currently supported".to_string(),
-                )),
+                TableConstraint::ForeignKey { .. } => {
+                    _plan_err!("Foreign key constraints are not currently supported")
+                }
+                TableConstraint::Check { .. } => {
+                    _plan_err!("Check constraints are not currently supported")
+                }
+                TableConstraint::Index { .. } => {
+                    _plan_err!("Indexes are not currently supported")
+                }
+                TableConstraint::FulltextOrSpatial { .. } => {
+                    _plan_err!("Indexes are not currently supported")
+                }
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Constraints::new(constraints))
+        Ok(Constraints::new_unverified(constraints))
     }
 
     /// Check whether constraints is empty
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+}
+
+impl IntoIterator for Constraints {
+    type Item = Constraint;
+    type IntoIter = IntoIter<Constraint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
     }
 }
 
@@ -534,7 +549,7 @@ mod tests {
 
     #[test]
     fn constraints_iter() {
-        let constraints = Constraints::new(vec![
+        let constraints = Constraints::new_unverified(vec![
             Constraint::PrimaryKey(vec![10]),
             Constraint::Unique(vec![20]),
         ]);
@@ -542,5 +557,22 @@ mod tests {
         assert_eq!(iter.next(), Some(&Constraint::PrimaryKey(vec![10])));
         assert_eq!(iter.next(), Some(&Constraint::Unique(vec![20])));
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_get_updated_id_keys() {
+        let fund_dependencies =
+            FunctionalDependencies::new(vec![FunctionalDependence::new(
+                vec![1],
+                vec![0, 1, 2],
+                true,
+            )]);
+        let res = fund_dependencies.project_functional_dependencies(&[1, 2], 2);
+        let expected = FunctionalDependencies::new(vec![FunctionalDependence::new(
+            vec![0],
+            vec![0, 1],
+            true,
+        )]);
+        assert_eq!(res, expected);
     }
 }

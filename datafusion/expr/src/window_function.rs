@@ -25,7 +25,7 @@ use crate::type_coercion::functions::data_types;
 use crate::utils;
 use crate::{AggregateUDF, Signature, TypeSignature, Volatility, WindowUDF};
 use arrow::datatypes::DataType;
-use datafusion_common::{plan_err, DataFusionError, Result};
+use datafusion_common::{plan_datafusion_err, plan_err, DataFusionError, Result};
 use std::sync::Arc;
 use std::{fmt, str::FromStr};
 use strum_macros::EnumIter;
@@ -171,12 +171,8 @@ impl WindowFunction {
             WindowFunction::BuiltInWindowFunction(fun) => {
                 fun.return_type(input_expr_types)
             }
-            WindowFunction::AggregateUDF(fun) => {
-                Ok((*(fun.return_type)(input_expr_types)?).clone())
-            }
-            WindowFunction::WindowUDF(fun) => {
-                Ok((*(fun.return_type)(input_expr_types)?).clone())
-            }
+            WindowFunction::AggregateUDF(fun) => fun.return_type(input_expr_types),
+            WindowFunction::WindowUDF(fun) => fun.return_type(input_expr_types),
         }
     }
 }
@@ -192,11 +188,14 @@ impl BuiltInWindowFunction {
             // original errors are all related to wrong function signature
             // aggregate them for better error message
             .map_err(|_| {
-                DataFusionError::Plan(utils::generate_signature_error_msg(
-                    &format!("{self}"),
-                    self.signature(),
-                    input_expr_types,
-                ))
+                plan_datafusion_err!(
+                    "{}",
+                    utils::generate_signature_error_msg(
+                        &format!("{self}"),
+                        self.signature(),
+                        input_expr_types,
+                    )
+                )
             })?;
 
         match self {
@@ -231,8 +230,8 @@ impl WindowFunction {
         match self {
             WindowFunction::AggregateFunction(fun) => fun.signature(),
             WindowFunction::BuiltInWindowFunction(fun) => fun.signature(),
-            WindowFunction::AggregateUDF(fun) => fun.signature.clone(),
-            WindowFunction::WindowUDF(fun) => fun.signature.clone(),
+            WindowFunction::AggregateUDF(fun) => fun.signature().clone(),
+            WindowFunction::WindowUDF(fun) => fun.signature().clone(),
         }
     }
 }
@@ -278,6 +277,7 @@ impl BuiltInWindowFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn test_count_return_type() -> Result<()> {
@@ -443,5 +443,19 @@ mod tests {
             ))
         );
         assert_eq!(find_df_window_func("not_exist"), None)
+    }
+
+    #[test]
+    // Test for BuiltInWindowFunction's Display and from_str() implementations.
+    // For each variant in BuiltInWindowFunction, it converts the variant to a string
+    // and then back to a variant. The test asserts that the original variant and
+    // the reconstructed variant are the same. This assertion is also necessary for
+    // function suggestion. See https://github.com/apache/arrow-datafusion/issues/8082
+    fn test_display_and_from_str() {
+        for func_original in BuiltInWindowFunction::iter() {
+            let func_name = func_original.to_string();
+            let func_from_str = BuiltInWindowFunction::from_str(&func_name).unwrap();
+            assert_eq!(func_from_str, func_original);
+        }
     }
 }

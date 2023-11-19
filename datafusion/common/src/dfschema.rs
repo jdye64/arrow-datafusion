@@ -24,7 +24,9 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::error::{unqualified_field_not_found, DataFusionError, Result, SchemaError};
+use crate::error::{
+    unqualified_field_not_found, DataFusionError, Result, SchemaError, _plan_err,
+};
 use crate::{
     field_not_found, Column, FunctionalDependencies, OwnedTableReference, TableReference,
 };
@@ -32,10 +34,75 @@ use crate::{
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 
-/// A reference-counted reference to a `DFSchema`.
+/// A reference-counted reference to a [DFSchema].
 pub type DFSchemaRef = Arc<DFSchema>;
 
-/// DFSchema wraps an Arrow schema and adds relation names
+/// DFSchema wraps an Arrow schema and adds relation names.
+///
+/// The schema may hold the fields across multiple tables. Some fields may be
+/// qualified and some unqualified. A qualified field is a field that has a
+/// relation name associated with it.
+///
+/// Unqualified fields must be unique not only amongst themselves, but also must
+/// have a distinct name from any qualified field names. This allows finding a
+/// qualified field by name to be possible, so long as there aren't multiple
+/// qualified fields with the same name.
+///
+/// There is an alias to `Arc<DFSchema>` named [DFSchemaRef].
+///
+/// # Creating qualified schemas
+///
+/// Use [DFSchema::try_from_qualified_schema] to create a qualified schema from
+/// an Arrow schema.
+///
+/// ```rust
+/// use datafusion_common::{DFSchema, Column};
+/// use arrow_schema::{DataType, Field, Schema};
+///
+/// let arrow_schema = Schema::new(vec![
+///    Field::new("c1", DataType::Int32, false),
+/// ]);
+///
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
+/// let column = Column::from_qualified_name("t1.c1");
+/// assert!(df_schema.has_column(&column));
+///
+/// // Can also access qualified fields with unqualified name, if it's unambiguous
+/// let column = Column::from_qualified_name("c1");
+/// assert!(df_schema.has_column(&column));
+/// ```
+///
+/// # Creating unqualified schemas
+///
+/// Create an unqualified schema using TryFrom:
+///
+/// ```rust
+/// use datafusion_common::{DFSchema, Column};
+/// use arrow_schema::{DataType, Field, Schema};
+///
+/// let arrow_schema = Schema::new(vec![
+///    Field::new("c1", DataType::Int32, false),
+/// ]);
+///
+/// let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+/// let column = Column::new_unqualified("c1");
+/// assert!(df_schema.has_column(&column));
+/// ```
+///
+/// # Converting back to Arrow schema
+///
+/// Use the `Into` trait to convert `DFSchema` into an Arrow schema:
+///
+/// ```rust
+/// use datafusion_common::{DFSchema, DFField};
+/// use arrow_schema::Schema;
+///
+/// let df_schema = DFSchema::new(vec![
+///    DFField::new_unqualified("c1", arrow::datatypes::DataType::Int32, false),
+/// ]).unwrap();
+/// let schema = Schema::from(df_schema);
+/// assert_eq!(schema.fields().len(), 1);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DFSchema {
     /// Fields
@@ -110,6 +177,9 @@ impl DFSchema {
     }
 
     /// Create a `DFSchema` from an Arrow schema and a given qualifier
+    ///
+    /// To create a schema from an Arrow schema without a qualifier, use
+    /// `DFSchema::try_from`.
     pub fn try_from_qualified_schema<'a>(
         qualifier: impl Into<TableReference<'a>>,
         schema: &Schema,
@@ -187,10 +257,10 @@ impl DFSchema {
                 match &self.fields[i].qualifier {
                     Some(qualifier) => {
                         if (qualifier.to_string() + "." + self.fields[i].name()) == name {
-                            return Err(DataFusionError::Plan(format!(
+                            return _plan_err!(
                                 "Fully qualified field name '{name}' was supplied to `index_of` \
                                 which is deprecated. Please use `index_of_column_by_name` instead"
-                            )));
+                            );
                         }
                     }
                     None => (),
@@ -378,12 +448,11 @@ impl DFSchema {
             .zip(arrow_schema.fields().iter())
             .try_for_each(|(l_field, r_field)| {
                 if !can_cast_types(r_field.data_type(), l_field.data_type()) {
-                    Err(DataFusionError::Plan(
-                        format!("Column {} (type: {}) is not compatible with column {} (type: {})",
+                    _plan_err!("Column {} (type: {}) is not compatible with column {} (type: {})",
                                 r_field.name(),
                                 r_field.data_type(),
                                 l_field.name(),
-                                l_field.data_type())))
+                                l_field.data_type())
                 } else {
                     Ok(())
                 }
@@ -391,10 +460,32 @@ impl DFSchema {
     }
 
     /// Returns true if the two schemas have the same qualified named
+    /// fields with logically equivalent data types. Returns false otherwise.
+    ///
+    /// Use [DFSchema]::equivalent_names_and_types for stricter semantic type
+    /// equivalence checking.
+    pub fn logically_equivalent_names_and_types(&self, other: &Self) -> bool {
+        if self.fields().len() != other.fields().len() {
+            return false;
+        }
+        let self_fields = self.fields().iter();
+        let other_fields = other.fields().iter();
+        self_fields.zip(other_fields).all(|(f1, f2)| {
+            f1.qualifier() == f2.qualifier()
+                && f1.name() == f2.name()
+                && Self::datatype_is_logically_equal(f1.data_type(), f2.data_type())
+        })
+    }
+
+    /// Returns true if the two schemas have the same qualified named
     /// fields with the same data types. Returns false otherwise.
     ///
     /// This is a specialized version of Eq that ignores differences
     /// in nullability and metadata.
+    ///
+    /// Use [DFSchema]::logically_equivalent_names_and_types for a weaker
+    /// logical type checking, which for example would consider a dictionary
+    /// encoded UTF8 array to be equivalent to a plain UTF8 array.
     pub fn equivalent_names_and_types(&self, other: &Self) -> bool {
         if self.fields().len() != other.fields().len() {
             return false;
@@ -406,6 +497,46 @@ impl DFSchema {
                 && f1.name() == f2.name()
                 && Self::datatype_is_semantically_equal(f1.data_type(), f2.data_type())
         })
+    }
+
+    /// Checks if two [`DataType`]s are logically equal. This is a notably weaker constraint
+    /// than datatype_is_semantically_equal in that a Dictionary<K,V> type is logically
+    /// equal to a plain V type, but not semantically equal. Dictionary<K1, V1> is also
+    /// logically equal to Dictionary<K2, V1>.
+    fn datatype_is_logically_equal(dt1: &DataType, dt2: &DataType) -> bool {
+        // check nested fields
+        match (dt1, dt2) {
+            (DataType::Dictionary(_, v1), DataType::Dictionary(_, v2)) => {
+                v1.as_ref() == v2.as_ref()
+            }
+            (DataType::Dictionary(_, v1), othertype) => v1.as_ref() == othertype,
+            (othertype, DataType::Dictionary(_, v1)) => v1.as_ref() == othertype,
+            (DataType::List(f1), DataType::List(f2))
+            | (DataType::LargeList(f1), DataType::LargeList(f2))
+            | (DataType::FixedSizeList(f1, _), DataType::FixedSizeList(f2, _))
+            | (DataType::Map(f1, _), DataType::Map(f2, _)) => {
+                Self::field_is_logically_equal(f1, f2)
+            }
+            (DataType::Struct(fields1), DataType::Struct(fields2)) => {
+                let iter1 = fields1.iter();
+                let iter2 = fields2.iter();
+                fields1.len() == fields2.len() &&
+                        // all fields have to be the same
+                    iter1
+                    .zip(iter2)
+                        .all(|(f1, f2)| Self::field_is_logically_equal(f1, f2))
+            }
+            (DataType::Union(fields1, _), DataType::Union(fields2, _)) => {
+                let iter1 = fields1.iter();
+                let iter2 = fields2.iter();
+                fields1.len() == fields2.len() &&
+                    // all fields have to be the same
+                    iter1
+                        .zip(iter2)
+                        .all(|((t1, f1), (t2, f2))| t1 == t2 && Self::field_is_logically_equal(f1, f2))
+            }
+            _ => dt1 == dt2,
+        }
     }
 
     /// Returns true of two [`DataType`]s are semantically equal (same
@@ -443,8 +574,21 @@ impl DFSchema {
                         .zip(iter2)
                         .all(|((t1, f1), (t2, f2))| t1 == t2 && Self::field_is_semantically_equal(f1, f2))
             }
+            (
+                DataType::Decimal128(_l_precision, _l_scale),
+                DataType::Decimal128(_r_precision, _r_scale),
+            ) => true,
+            (
+                DataType::Decimal256(_l_precision, _l_scale),
+                DataType::Decimal256(_r_precision, _r_scale),
+            ) => true,
             _ => dt1 == dt2,
         }
+    }
+
+    fn field_is_logically_equal(f1: &Field, f2: &Field) -> bool {
+        f1.name() == f2.name()
+            && Self::datatype_is_logically_equal(f1.data_type(), f2.data_type())
     }
 
     fn field_is_semantically_equal(f1: &Field, f2: &Field) -> bool {
@@ -777,6 +921,13 @@ pub trait SchemaExt {
     ///
     /// It works the same as [`DFSchema::equivalent_names_and_types`].
     fn equivalent_names_and_types(&self, other: &Self) -> bool;
+
+    /// Returns true if the two schemas have the same qualified named
+    /// fields with logically equivalent data types. Returns false otherwise.
+    ///
+    /// Use [DFSchema]::equivalent_names_and_types for stricter semantic type
+    /// equivalence checking.
+    fn logically_equivalent_names_and_types(&self, other: &Self) -> bool;
 }
 
 impl SchemaExt for Schema {
@@ -791,6 +942,23 @@ impl SchemaExt for Schema {
             .all(|(f1, f2)| {
                 f1.name() == f2.name()
                     && DFSchema::datatype_is_semantically_equal(
+                        f1.data_type(),
+                        f2.data_type(),
+                    )
+            })
+    }
+
+    fn logically_equivalent_names_and_types(&self, other: &Self) -> bool {
+        if self.fields().len() != other.fields().len() {
+            return false;
+        }
+
+        self.fields()
+            .iter()
+            .zip(other.fields().iter())
+            .all(|(f1, f2)| {
+                f1.name() == f2.name()
+                    && DFSchema::datatype_is_logically_equal(
                         f1.data_type(),
                         f2.data_type(),
                     )

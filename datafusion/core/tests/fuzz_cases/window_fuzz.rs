@@ -22,128 +22,123 @@ use arrow::compute::{concat_batches, SortOptions};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use hashbrown::HashMap;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::windows::{
     create_window_expr, BoundedWindowAggExec, PartitionSearchMode, WindowAggExec,
 };
 use datafusion::physical_plan::{collect, ExecutionPlan};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_common::{Result, ScalarValue};
+use datafusion_expr::type_coercion::aggregates::coerce_types;
 use datafusion_expr::{
     AggregateFunction, BuiltInWindowFunction, WindowFrame, WindowFrameBound,
     WindowFrameUnits, WindowFunction,
 };
-
-use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::type_coercion::aggregates::coerce_types;
 use datafusion_physical_expr::expressions::{cast, col, lit};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use test_utils::add_empty_batches;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::physical_plan::windows::PartitionSearchMode::{
-        Linear, PartiallySorted, Sorted,
-    };
+use hashbrown::HashMap;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn window_bounded_window_random_comparison() -> Result<()> {
-        // make_staggered_batches gives result sorted according to a, b, c
-        // In the test cases first entry represents partition by columns
-        // Second entry represents order by columns.
-        // Third entry represents search mode.
-        // In sorted mode physical plans are in the form for WindowAggExec
-        //```
-        // WindowAggExec
-        //   MemoryExec]
-        // ```
-        // and in the form for BoundedWindowAggExec
-        // ```
-        // BoundedWindowAggExec
-        //   MemoryExec
-        // ```
-        // In Linear and PartiallySorted mode physical plans are in the form for WindowAggExec
-        //```
-        // WindowAggExec
-        //   SortExec(required by window function)
-        //     MemoryExec]
-        // ```
-        // and in the form for BoundedWindowAggExec
-        // ```
-        // BoundedWindowAggExec
-        //   MemoryExec
-        // ```
-        let test_cases = vec![
-            (vec!["a"], vec!["a"], Sorted),
-            (vec!["a"], vec!["b"], Sorted),
-            (vec!["a"], vec!["a", "b"], Sorted),
-            (vec!["a"], vec!["b", "c"], Sorted),
-            (vec!["a"], vec!["a", "b", "c"], Sorted),
-            (vec!["b"], vec!["a"], Linear),
-            (vec!["b"], vec!["a", "b"], Linear),
-            (vec!["b"], vec!["a", "c"], Linear),
-            (vec!["b"], vec!["a", "b", "c"], Linear),
-            (vec!["c"], vec!["a"], Linear),
-            (vec!["c"], vec!["a", "b"], Linear),
-            (vec!["c"], vec!["a", "c"], Linear),
-            (vec!["c"], vec!["a", "b", "c"], Linear),
-            (vec!["b", "a"], vec!["a"], Sorted),
-            (vec!["b", "a"], vec!["b"], Sorted),
-            (vec!["b", "a"], vec!["c"], Sorted),
-            (vec!["b", "a"], vec!["a", "b"], Sorted),
-            (vec!["b", "a"], vec!["b", "c"], Sorted),
-            (vec!["b", "a"], vec!["a", "c"], Sorted),
-            (vec!["b", "a"], vec!["a", "b", "c"], Sorted),
-            (vec!["c", "b"], vec!["a"], Linear),
-            (vec!["c", "b"], vec!["a", "b"], Linear),
-            (vec!["c", "b"], vec!["a", "c"], Linear),
-            (vec!["c", "b"], vec!["a", "b", "c"], Linear),
-            (vec!["c", "a"], vec!["a"], PartiallySorted(vec![1])),
-            (vec!["c", "a"], vec!["b"], PartiallySorted(vec![1])),
-            (vec!["c", "a"], vec!["c"], PartiallySorted(vec![1])),
-            (vec!["c", "a"], vec!["a", "b"], PartiallySorted(vec![1])),
-            (vec!["c", "a"], vec!["b", "c"], PartiallySorted(vec![1])),
-            (vec!["c", "a"], vec!["a", "c"], PartiallySorted(vec![1])),
-            (
-                vec!["c", "a"],
-                vec!["a", "b", "c"],
-                PartiallySorted(vec![1]),
-            ),
-            (vec!["c", "b", "a"], vec!["a"], Sorted),
-            (vec!["c", "b", "a"], vec!["b"], Sorted),
-            (vec!["c", "b", "a"], vec!["c"], Sorted),
-            (vec!["c", "b", "a"], vec!["a", "b"], Sorted),
-            (vec!["c", "b", "a"], vec!["b", "c"], Sorted),
-            (vec!["c", "b", "a"], vec!["a", "c"], Sorted),
-            (vec!["c", "b", "a"], vec!["a", "b", "c"], Sorted),
-        ];
-        let n = 300;
-        let n_distincts = vec![10, 20];
-        for n_distinct in n_distincts {
-            let mut handles = Vec::new();
-            for i in 0..n {
-                let idx = i % test_cases.len();
-                let (pb_cols, ob_cols, search_mode) = test_cases[idx].clone();
-                let job = tokio::spawn(run_window_test(
-                    make_staggered_batches::<true>(1000, n_distinct, i as u64),
-                    i as u64,
-                    pb_cols,
-                    ob_cols,
-                    search_mode,
-                ));
-                handles.push(job);
-            }
-            for job in handles {
-                job.await.unwrap()?;
-            }
+use datafusion_physical_plan::windows::PartitionSearchMode::{
+    Linear, PartiallySorted, Sorted,
+};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn window_bounded_window_random_comparison() -> Result<()> {
+    // make_staggered_batches gives result sorted according to a, b, c
+    // In the test cases first entry represents partition by columns
+    // Second entry represents order by columns.
+    // Third entry represents search mode.
+    // In sorted mode physical plans are in the form for WindowAggExec
+    //```
+    // WindowAggExec
+    //   MemoryExec]
+    // ```
+    // and in the form for BoundedWindowAggExec
+    // ```
+    // BoundedWindowAggExec
+    //   MemoryExec
+    // ```
+    // In Linear and PartiallySorted mode physical plans are in the form for WindowAggExec
+    //```
+    // WindowAggExec
+    //   SortExec(required by window function)
+    //     MemoryExec]
+    // ```
+    // and in the form for BoundedWindowAggExec
+    // ```
+    // BoundedWindowAggExec
+    //   MemoryExec
+    // ```
+    let test_cases = vec![
+        (vec!["a"], vec!["a"], Sorted),
+        (vec!["a"], vec!["b"], Sorted),
+        (vec!["a"], vec!["a", "b"], Sorted),
+        (vec!["a"], vec!["b", "c"], Sorted),
+        (vec!["a"], vec!["a", "b", "c"], Sorted),
+        (vec!["b"], vec!["a"], Linear),
+        (vec!["b"], vec!["a", "b"], Linear),
+        (vec!["b"], vec!["a", "c"], Linear),
+        (vec!["b"], vec!["a", "b", "c"], Linear),
+        (vec!["c"], vec!["a"], Linear),
+        (vec!["c"], vec!["a", "b"], Linear),
+        (vec!["c"], vec!["a", "c"], Linear),
+        (vec!["c"], vec!["a", "b", "c"], Linear),
+        (vec!["b", "a"], vec!["a"], Sorted),
+        (vec!["b", "a"], vec!["b"], Sorted),
+        (vec!["b", "a"], vec!["c"], Sorted),
+        (vec!["b", "a"], vec!["a", "b"], Sorted),
+        (vec!["b", "a"], vec!["b", "c"], Sorted),
+        (vec!["b", "a"], vec!["a", "c"], Sorted),
+        (vec!["b", "a"], vec!["a", "b", "c"], Sorted),
+        (vec!["c", "b"], vec!["a"], Linear),
+        (vec!["c", "b"], vec!["a", "b"], Linear),
+        (vec!["c", "b"], vec!["a", "c"], Linear),
+        (vec!["c", "b"], vec!["a", "b", "c"], Linear),
+        (vec!["c", "a"], vec!["a"], PartiallySorted(vec![1])),
+        (vec!["c", "a"], vec!["b"], PartiallySorted(vec![1])),
+        (vec!["c", "a"], vec!["c"], PartiallySorted(vec![1])),
+        (vec!["c", "a"], vec!["a", "b"], PartiallySorted(vec![1])),
+        (vec!["c", "a"], vec!["b", "c"], PartiallySorted(vec![1])),
+        (vec!["c", "a"], vec!["a", "c"], PartiallySorted(vec![1])),
+        (
+            vec!["c", "a"],
+            vec!["a", "b", "c"],
+            PartiallySorted(vec![1]),
+        ),
+        (vec!["c", "b", "a"], vec!["a"], Sorted),
+        (vec!["c", "b", "a"], vec!["b"], Sorted),
+        (vec!["c", "b", "a"], vec!["c"], Sorted),
+        (vec!["c", "b", "a"], vec!["a", "b"], Sorted),
+        (vec!["c", "b", "a"], vec!["b", "c"], Sorted),
+        (vec!["c", "b", "a"], vec!["a", "c"], Sorted),
+        (vec!["c", "b", "a"], vec!["a", "b", "c"], Sorted),
+    ];
+    let n = 300;
+    let n_distincts = vec![10, 20];
+    for n_distinct in n_distincts {
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let idx = i % test_cases.len();
+            let (pb_cols, ob_cols, search_mode) = test_cases[idx].clone();
+            let job = tokio::spawn(run_window_test(
+                make_staggered_batches::<true>(1000, n_distinct, i as u64),
+                i as u64,
+                pb_cols,
+                ob_cols,
+                search_mode,
+            ));
+            handles.push(job);
         }
-        Ok(())
+        for job in handles {
+            job.await.unwrap()?;
+        }
     }
+    Ok(())
 }
 
 fn get_random_function(
@@ -396,7 +391,7 @@ async fn run_window_test(
     let mut rng = StdRng::seed_from_u64(random_seed);
     let schema = input1[0].schema();
     let session_config = SessionConfig::new().with_batch_size(50);
-    let ctx = SessionContext::with_config(session_config);
+    let ctx = SessionContext::new_with_config(session_config);
     let (window_fn, args, fn_name) = get_random_function(&schema, &mut rng, is_linear);
 
     let window_frame = get_random_window_frame(&mut rng, is_linear);
@@ -461,7 +456,6 @@ async fn run_window_test(
             )
             .unwrap()],
             exec1,
-            schema.clone(),
             vec![],
         )
         .unwrap(),
@@ -484,7 +478,6 @@ async fn run_window_test(
             )
             .unwrap()],
             exec2,
-            schema.clone(),
             vec![],
             search_mode,
         )

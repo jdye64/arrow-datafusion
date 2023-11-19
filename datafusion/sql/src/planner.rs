@@ -24,8 +24,8 @@ use arrow_schema::*;
 use datafusion_common::field_not_found;
 use datafusion_common::internal_err;
 use datafusion_expr::WindowUDF;
-use sqlparser::ast::ExactNumberInfo;
 use sqlparser::ast::TimezoneInfo;
+use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
 
@@ -45,8 +45,12 @@ use crate::utils::make_decimal_type;
 /// The ContextProvider trait allows the query planner to obtain meta-data about tables and
 /// functions referenced in SQL statements
 pub trait ContextProvider {
+    #[deprecated(since = "32.0.0", note = "please use `get_table_source` instead")]
+    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+        self.get_table_source(name)
+    }
     /// Getter for a datasource
-    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
+    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
     /// Getter for a UDF description
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>>;
     /// Getter for a UDAF description
@@ -186,22 +190,22 @@ impl PlannerContext {
 
 /// SQL query planner
 pub struct SqlToRel<'a, S: ContextProvider> {
-    pub(crate) schema_provider: &'a S,
+    pub(crate) context_provider: &'a S,
     pub(crate) options: ParserOptions,
     pub(crate) normalizer: IdentNormalizer,
 }
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Create a new query planner
-    pub fn new(schema_provider: &'a S) -> Self {
-        Self::new_with_options(schema_provider, ParserOptions::default())
+    pub fn new(context_provider: &'a S) -> Self {
+        Self::new_with_options(context_provider, ParserOptions::default())
     }
 
     /// Create a new query planner
-    pub fn new_with_options(schema_provider: &'a S, options: ParserOptions) -> Self {
+    pub fn new_with_options(context_provider: &'a S, options: ParserOptions) -> Self {
         let normalize = options.enable_ident_normalization;
         SqlToRel {
-            schema_provider,
+            context_provider,
             options,
             normalizer: IdentNormalizer::new(normalize),
         }
@@ -293,14 +297,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     pub(crate) fn convert_data_type(&self, sql_type: &SQLDataType) -> Result<DataType> {
         match sql_type {
-            SQLDataType::Array(Some(inner_sql_type)) => {
+            SQLDataType::Array(ArrayElemTypeDef::AngleBracket(inner_sql_type))
+            | SQLDataType::Array(ArrayElemTypeDef::SquareBracket(inner_sql_type)) => {
                 let data_type = self.convert_simple_data_type(inner_sql_type)?;
 
                 Ok(DataType::List(Arc::new(Field::new(
                     "field", data_type, true,
                 ))))
             }
-            SQLDataType::Array(None) => {
+            SQLDataType::Array(ArrayElemTypeDef::None) => {
                 not_impl_err!("Arrays with unspecified type is not supported")
             }
             other => self.convert_simple_data_type(other),
@@ -326,7 +331,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLDataType::Char(_)
             | SQLDataType::Varchar(_)
             | SQLDataType::Text
-            | SQLDataType::String => Ok(DataType::Utf8),
+            | SQLDataType::String(_) => Ok(DataType::Utf8),
             SQLDataType::Timestamp(None, tz_info) => {
                 let tz = if matches!(tz_info, TimezoneInfo::Tz)
                     || matches!(tz_info, TimezoneInfo::WithTimeZone)
@@ -334,7 +339,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     // Timestamp With Time Zone
                     // INPUT : [SQLDataType]   TimestampTz + [RuntimeConfig] Time Zone
                     // OUTPUT: [ArrowDataType] Timestamp<TimeUnit, Some(Time Zone)>
-                    self.schema_provider.options().execution.time_zone.clone()
+                    self.context_provider.options().execution.time_zone.clone()
                 } else {
                     // Timestamp Without Time zone
                     None
@@ -396,7 +401,12 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::Dec(_)
             | SQLDataType::BigNumeric(_)
             | SQLDataType::BigDecimal(_)
-            | SQLDataType::Clob(_) => not_impl_err!(
+            | SQLDataType::Clob(_)
+            | SQLDataType::Bytes(_)
+            | SQLDataType::Int64
+            | SQLDataType::Float64
+            | SQLDataType::Struct(_)
+            => not_impl_err!(
                 "Unsupported SQL type {sql_type:?}"
             ),
         }

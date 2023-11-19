@@ -59,7 +59,7 @@ use std::sync::Arc;
 /// [`PlainAggregateWindowExpr`]: crate::window::PlainAggregateWindowExpr
 /// [`SlidingAggregateWindowExpr`]: crate::window::SlidingAggregateWindowExpr
 pub trait WindowExpr: Send + Sync + Debug {
-    /// Returns the window expression as [`Any`](std::any::Any) so that it can be
+    /// Returns the window expression as [`Any`] so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -82,8 +82,10 @@ pub trait WindowExpr: Send + Sync + Debug {
     fn evaluate_args(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
         self.expressions()
             .iter()
-            .map(|e| e.evaluate(batch))
-            .map(|r| r.map(|v| v.into_array(batch.num_rows())))
+            .map(|e| {
+                e.evaluate(batch)
+                    .and_then(|v| v.into_array(batch.num_rows()))
+            })
             .collect()
     }
 

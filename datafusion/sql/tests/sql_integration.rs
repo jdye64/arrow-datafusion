@@ -201,7 +201,7 @@ fn cast_to_invalid_decimal_type_precision_0() {
         let sql = "SELECT CAST(10 AS DECIMAL(0))";
         let err = logical_plan(sql).expect_err("query should have failed");
         assert_eq!(
-            "Error during planning: Decimal(precision = 0, scale = 0) should satisfy `0 < precision <= 38`, and `scale <= precision`.",
+            "Error during planning: Decimal(precision = 0, scale = 0) should satisfy `0 < precision <= 76`, and `scale <= precision`.",
             err.strip_backtrace()
         );
     }
@@ -212,9 +212,19 @@ fn cast_to_invalid_decimal_type_precision_gt_38() {
     // precision > 38
     {
         let sql = "SELECT CAST(10 AS DECIMAL(39))";
+        let plan = "Projection: CAST(Int64(10) AS Decimal256(39, 0))\n  EmptyRelation";
+        quick_test(sql, plan);
+    }
+}
+
+#[test]
+fn cast_to_invalid_decimal_type_precision_gt_76() {
+    // precision > 76
+    {
+        let sql = "SELECT CAST(10 AS DECIMAL(79))";
         let err = logical_plan(sql).expect_err("query should have failed");
         assert_eq!(
-            "Error during planning: Decimal(precision = 39, scale = 0) should satisfy `0 < precision <= 38`, and `scale <= precision`.",
+            "Error during planning: Decimal(precision = 79, scale = 0) should satisfy `0 < precision <= 76`, and `scale <= precision`.",
             err.strip_backtrace()
         );
     }
@@ -227,7 +237,7 @@ fn cast_to_invalid_decimal_type_precision_lt_scale() {
         let sql = "SELECT CAST(10 AS DECIMAL(5, 10))";
         let err = logical_plan(sql).expect_err("query should have failed");
         assert_eq!(
-            "Error during planning: Decimal(precision = 5, scale = 10) should satisfy `0 < precision <= 38`, and `scale <= precision`.",
+            "Error during planning: Decimal(precision = 5, scale = 10) should satisfy `0 < precision <= 76`, and `scale <= precision`.",
             err.strip_backtrace()
         );
     }
@@ -412,12 +422,11 @@ CopyTo: format=csv output_url=output.csv single_file_output=true options: ()
 fn plan_insert() {
     let sql =
         "insert into person (id, first_name, last_name) values (1, 'Alan', 'Turing')";
-    let plan = r#"
-Dml: op=[Insert Into] table=[person]
-  Projection: CAST(column1 AS UInt32) AS id, column2 AS first_name, column3 AS last_name
-    Values: (Int64(1), Utf8("Alan"), Utf8("Turing"))
-    "#
-    .trim();
+    let plan = "Dml: op=[Insert Into] table=[person]\
+                \n  Projection: CAST(column1 AS UInt32) AS id, column2 AS first_name, column3 AS last_name, \
+                        CAST(NULL AS Int32) AS age, CAST(NULL AS Utf8) AS state, CAST(NULL AS Float64) AS salary, \
+                        CAST(NULL AS Timestamp(Nanosecond, None)) AS birth_date, CAST(NULL AS Int32) AS 😀\
+                \n    Values: (Int64(1), Utf8(\"Alan\"), Utf8(\"Turing\"))";
     quick_test(sql, plan);
 }
 
@@ -1278,6 +1287,16 @@ fn select_simple_aggregate_repeated_aggregate_with_unique_aliases() {
 }
 
 #[test]
+fn select_simple_aggregate_respect_nulls() {
+    let sql = "SELECT MIN(age) RESPECT NULLS FROM person";
+    let err = logical_plan(sql).expect_err("query should have failed");
+
+    assert_contains!(
+        err.strip_backtrace(),
+        "This feature is not implemented: Null treatment in aggregate functions is not supported: RESPECT NULLS"
+    );
+}
+#[test]
 fn select_from_typed_string_values() {
     quick_test(
             "SELECT col1, col2 FROM (VALUES (TIMESTAMP '2021-06-10 17:01:00Z', DATE '2004-04-09')) as t (col1, col2)",
@@ -1687,20 +1706,24 @@ fn select_order_by_multiple_index() {
 #[test]
 fn select_order_by_index_of_0() {
     let sql = "SELECT id FROM person ORDER BY 0";
-    let err = logical_plan(sql).expect_err("query should have failed");
+    let err = logical_plan(sql)
+        .expect_err("query should have failed")
+        .strip_backtrace();
     assert_eq!(
-        "Plan(\"Order by index starts at 1 for column indexes\")",
-        format!("{err:?}")
+        "Error during planning: Order by index starts at 1 for column indexes",
+        err
     );
 }
 
 #[test]
 fn select_order_by_index_oob() {
     let sql = "SELECT id FROM person ORDER BY 2";
-    let err = logical_plan(sql).expect_err("query should have failed");
+    let err = logical_plan(sql)
+        .expect_err("query should have failed")
+        .strip_backtrace();
     assert_eq!(
-        "Plan(\"Order by column out of bounds, specified: 2, max: 1\")",
-        format!("{err:?}")
+        "Error during planning: Order by column out of bounds, specified: 2, max: 1",
+        err
     );
 }
 
@@ -1803,6 +1826,14 @@ fn select_7480_2() {
 fn create_external_table_csv() {
     let sql = "CREATE EXTERNAL TABLE t(c1 int) STORED AS CSV LOCATION 'foo.csv'";
     let expected = "CreateExternalTable: Bare { table: \"t\" }";
+    quick_test(sql, expected);
+}
+
+#[test]
+fn create_external_table_with_pk() {
+    let sql = "CREATE EXTERNAL TABLE t(c1 int, primary key(c1)) STORED AS CSV LOCATION 'foo.csv'";
+    let expected =
+        "CreateExternalTable: Bare { table: \"t\" } constraints=[PrimaryKey([0])]";
     quick_test(sql, expected);
 }
 
@@ -2054,24 +2085,6 @@ fn union_all() {
 }
 
 #[test]
-fn union_4_combined_in_one() {
-    let sql = "SELECT order_id from orders
-                    UNION ALL SELECT order_id FROM orders
-                    UNION ALL SELECT order_id FROM orders
-                    UNION ALL SELECT order_id FROM orders";
-    let expected = "Union\
-            \n  Projection: orders.order_id\
-            \n    TableScan: orders\
-            \n  Projection: orders.order_id\
-            \n    TableScan: orders\
-            \n  Projection: orders.order_id\
-            \n    TableScan: orders\
-            \n  Projection: orders.order_id\
-            \n    TableScan: orders";
-    quick_test(sql, expected);
-}
-
-#[test]
 fn union_with_different_column_names() {
     let sql = "SELECT order_id from orders UNION ALL SELECT customer_id FROM orders";
     let expected = "Union\
@@ -2096,13 +2109,12 @@ fn union_values_with_no_alias() {
 #[test]
 fn union_with_incompatible_data_type() {
     let sql = "SELECT interval '1 year 1 day' UNION ALL SELECT 1";
-    let err = logical_plan(sql).expect_err("query should have failed");
+    let err = logical_plan(sql)
+        .expect_err("query should have failed")
+        .strip_backtrace();
     assert_eq!(
-        "Plan(\"UNION Column Int64(1) (type: Int64) is \
-            not compatible with column IntervalMonthDayNano\
-            (\\\"950737950189618795196236955648\\\") \
-            (type: Interval(MonthDayNano))\")",
-        format!("{err:?}")
+       "Error during planning: UNION Column Int64(1) (type: Int64) is not compatible with column IntervalMonthDayNano(\"950737950189618795196236955648\") (type: Interval(MonthDayNano))",
+       err
     );
 }
 
@@ -2205,10 +2217,12 @@ fn union_with_aliases() {
 #[test]
 fn union_with_incompatible_data_types() {
     let sql = "SELECT 'a' a UNION ALL SELECT true a";
-    let err = logical_plan(sql).expect_err("query should have failed");
+    let err = logical_plan(sql)
+        .expect_err("query should have failed")
+        .strip_backtrace();
     assert_eq!(
-        "Plan(\"UNION Column a (type: Boolean) is not compatible with column a (type: Utf8)\")",
-        format!("{err:?}")
+        "Error during planning: UNION Column a (type: Boolean) is not compatible with column a (type: Utf8)",
+        err
     );
 }
 
@@ -2701,7 +2715,7 @@ struct MockContextProvider {
 }
 
 impl ContextProvider for MockContextProvider {
-    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
         let schema = match name.table() {
             "test" => Ok(Schema::new(vec![
                 Field::new("t_date32", DataType::Date32, false),
@@ -3677,6 +3691,19 @@ fn test_prepare_statement_should_infer_types() {
 }
 
 #[test]
+fn test_non_prepare_statement_should_infer_types() {
+    // Non prepared statements (like SELECT) should also have their parameter types inferred
+    let sql = "SELECT 1 + $1";
+    let plan = logical_plan(sql).unwrap();
+    let actual_types = plan.get_parameter_types().unwrap();
+    let expected_types = HashMap::from([
+        // constant 1 is inferred to be int64
+        ("$1".to_string(), Some(DataType::Int64)),
+    ]);
+    assert_eq!(actual_types, expected_types);
+}
+
+#[test]
 #[should_panic(
     expected = "value: SQL(ParserError(\"Expected [NOT] NULL or TRUE|FALSE or [NOT] DISTINCT FROM after IS, found: $1\""
 )]
@@ -3895,6 +3922,40 @@ Projection: person.id, person.age
 }
 
 #[test]
+fn test_prepare_statement_infer_types_from_between_predicate() {
+    let sql = "SELECT id, age FROM person WHERE age BETWEEN $1 AND $2";
+
+    let expected_plan = r#"
+Projection: person.id, person.age
+  Filter: person.age BETWEEN $1 AND $2
+    TableScan: person
+        "#
+    .trim();
+
+    let expected_dt = "[Int32]";
+    let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
+
+    let actual_types = plan.get_parameter_types().unwrap();
+    let expected_types = HashMap::from([
+        ("$1".to_string(), Some(DataType::Int32)),
+        ("$2".to_string(), Some(DataType::Int32)),
+    ]);
+    assert_eq!(actual_types, expected_types);
+
+    // replace params with values
+    let param_values = vec![ScalarValue::Int32(Some(10)), ScalarValue::Int32(Some(30))];
+    let expected_plan = r#"
+Projection: person.id, person.age
+  Filter: person.age BETWEEN Int32(10) AND Int32(30)
+    TableScan: person
+        "#
+    .trim();
+    let plan = plan.replace_params_with_values(&param_values).unwrap();
+
+    prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);
+}
+
+#[test]
 fn test_prepare_statement_infer_types_subquery() {
     let sql = "SELECT id, age FROM person WHERE age = (select max(age) from person where id = $1)";
 
@@ -3975,12 +4036,11 @@ Dml: op=[Update] table=[person]
 fn test_prepare_statement_insert_infer() {
     let sql = "insert into person (id, first_name, last_name) values ($1, $2, $3)";
 
-    let expected_plan = r#"
-Dml: op=[Insert Into] table=[person]
-  Projection: column1 AS id, column2 AS first_name, column3 AS last_name
-    Values: ($1, $2, $3)
-        "#
-    .trim();
+    let expected_plan = "Dml: op=[Insert Into] table=[person]\
+                        \n  Projection: column1 AS id, column2 AS first_name, column3 AS last_name, \
+                                    CAST(NULL AS Int32) AS age, CAST(NULL AS Utf8) AS state, CAST(NULL AS Float64) AS salary, \
+                                    CAST(NULL AS Timestamp(Nanosecond, None)) AS birth_date, CAST(NULL AS Int32) AS 😀\
+                        \n    Values: ($1, $2, $3)";
 
     let expected_dt = "[Int32]";
     let plan = prepare_stmt_quick_test(sql, expected_plan, expected_dt);
@@ -3999,12 +4059,11 @@ Dml: op=[Insert Into] table=[person]
         ScalarValue::Utf8(Some("Alan".to_string())),
         ScalarValue::Utf8(Some("Turing".to_string())),
     ];
-    let expected_plan = r#"
-Dml: op=[Insert Into] table=[person]
-  Projection: column1 AS id, column2 AS first_name, column3 AS last_name
-    Values: (UInt32(1), Utf8("Alan"), Utf8("Turing"))
-        "#
-    .trim();
+    let expected_plan = "Dml: op=[Insert Into] table=[person]\
+                        \n  Projection: column1 AS id, column2 AS first_name, column3 AS last_name, \
+                                    CAST(NULL AS Int32) AS age, CAST(NULL AS Utf8) AS state, CAST(NULL AS Float64) AS salary, \
+                                    CAST(NULL AS Timestamp(Nanosecond, None)) AS birth_date, CAST(NULL AS Int32) AS 😀\
+                        \n    Values: (UInt32(1), Utf8(\"Alan\"), Utf8(\"Turing\"))";
     let plan = plan.replace_params_with_values(&param_values).unwrap();
 
     prepare_stmt_replace_params_quick_test(plan, param_values, expected_plan);

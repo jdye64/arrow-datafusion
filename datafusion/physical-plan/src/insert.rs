@@ -17,27 +17,28 @@
 
 //! Execution plan for writing data to [`DataSink`]s
 
+use std::any::Any;
+use std::fmt;
+use std::fmt::Debug;
+use std::sync::Arc;
+
 use super::expressions::PhysicalSortExpr;
 use super::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-    Statistics,
 };
+use crate::metrics::MetricsSet;
+use crate::stream::RecordBatchStreamAdapter;
+
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow_array::{ArrayRef, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use async_trait::async_trait;
-use core::fmt;
-use datafusion_common::Result;
-use datafusion_physical_expr::PhysicalSortRequirement;
-use futures::StreamExt;
-use std::any::Any;
-use std::fmt::Debug;
-use std::sync::Arc;
-
-use crate::stream::RecordBatchStreamAdapter;
-use datafusion_common::{exec_err, internal_err, DataFusionError};
+use datafusion_common::{exec_err, internal_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::{Distribution, PhysicalSortRequirement};
+
+use async_trait::async_trait;
+use futures::StreamExt;
 
 /// `DataSink` implements writing streams of [`RecordBatch`]es to
 /// user defined destinations.
@@ -46,6 +47,16 @@ use datafusion_execution::TaskContext;
 /// output.
 #[async_trait]
 pub trait DataSink: DisplayAs + Debug + Send + Sync {
+    /// Returns the data sink as [`Any`](std::any::Any) so that it can be
+    /// downcast to a specific implementation.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Return a snapshot of the [MetricsSet] for this
+    /// [DataSink].
+    ///
+    /// See [ExecutionPlan::metrics()] for more details
+    fn metrics(&self) -> Option<MetricsSet>;
+
     // TODO add desired input ordering
     // How does this sink want its input ordered?
 
@@ -56,7 +67,7 @@ pub trait DataSink: DisplayAs + Debug + Send + Sync {
     /// or rollback required.
     async fn write_all(
         &self,
-        data: Vec<SendableRecordBatchStream>,
+        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64>;
 }
@@ -73,6 +84,8 @@ pub struct FileSinkExec {
     sink_schema: SchemaRef,
     /// Schema describing the structure of the output data.
     count_schema: SchemaRef,
+    /// Optional required sort order for output data.
+    sort_order: Option<Vec<PhysicalSortRequirement>>,
 }
 
 impl fmt::Debug for FileSinkExec {
@@ -87,12 +100,14 @@ impl FileSinkExec {
         input: Arc<dyn ExecutionPlan>,
         sink: Arc<dyn DataSink>,
         sink_schema: SchemaRef,
+        sort_order: Option<Vec<PhysicalSortRequirement>>,
     ) -> Self {
         Self {
             input,
             sink,
             sink_schema,
             count_schema: make_count_schema(),
+            sort_order,
         }
     }
 
@@ -136,16 +151,24 @@ impl FileSinkExec {
         }
     }
 
-    fn execute_all_input_streams(
-        &self,
-        context: Arc<TaskContext>,
-    ) -> Result<Vec<SendableRecordBatchStream>> {
-        let n_input_parts = self.input.output_partitioning().partition_count();
-        let mut streams = Vec::with_capacity(n_input_parts);
-        for part in 0..n_input_parts {
-            streams.push(self.execute_input_stream(part, context.clone())?);
-        }
-        Ok(streams)
+    /// Input execution plan
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// Returns insert sink
+    pub fn sink(&self) -> &dyn DataSink {
+        self.sink.as_ref()
+    }
+
+    /// Optional sort order for output data
+    pub fn sort_order(&self) -> &Option<Vec<PhysicalSortRequirement>> {
+        &self.sort_order
+    }
+
+    /// Returns the metrics of the underlying [DataSink]
+    pub fn metrics(&self) -> Option<MetricsSet> {
+        self.sink.metrics()
     }
 }
 
@@ -157,7 +180,7 @@ impl DisplayAs for FileSinkExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "InsertExec: sink=")?;
+                write!(f, "FileSinkExec: sink=")?;
                 self.sink.fmt_as(t, f)
             }
         }
@@ -184,24 +207,32 @@ impl ExecutionPlan for FileSinkExec {
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // Incoming number of partitions is taken to be the
-        // number of files the query is required to write out.
-        // The optimizer should not change this number.
-        // Parrallelism is handled within the appropriate DataSink
+        // DataSink is responsible for dynamically partitioning its
+        // own input at execution time.
         vec![false]
     }
 
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // DataSink is responsible for dynamically partitioning its
+        // own input at execution time, and so requires a single input partition.
+        vec![Distribution::SinglePartition; self.children().len()]
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
-        // Require that the InsertExec gets the data in the order the
+        // The input order is either exlicitly set (such as by a ListingTable),
+        // or require that the [FileSinkExec] gets the data in the order the
         // input produced it (otherwise the optimizer may chose to reorder
         // the input which could result in unintended / poor UX)
         //
         // More rationale:
         // https://github.com/apache/arrow-datafusion/pull/6354#discussion_r1195284178
-        vec![self
-            .input
-            .output_ordering()
-            .map(PhysicalSortRequirement::from_sort_exprs)]
+        match &self.sort_order {
+            Some(requirements) => vec![Some(requirements.clone())],
+            None => vec![self
+                .input
+                .output_ordering()
+                .map(PhysicalSortRequirement::from_sort_exprs)],
+        }
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -221,6 +252,7 @@ impl ExecutionPlan for FileSinkExec {
             sink: self.sink.clone(),
             sink_schema: self.sink_schema.clone(),
             count_schema: self.count_schema.clone(),
+            sort_order: self.sort_order.clone(),
         }))
     }
 
@@ -238,7 +270,7 @@ impl ExecutionPlan for FileSinkExec {
         if partition != 0 {
             return internal_err!("FileSinkExec can only be called on partition 0!");
         }
-        let data = self.execute_all_input_streams(context.clone())?;
+        let data = self.execute_input_stream(0, context.clone())?;
 
         let count_schema = self.count_schema.clone();
         let sink = self.sink.clone();
@@ -252,10 +284,6 @@ impl ExecutionPlan for FileSinkExec {
             count_schema,
             stream,
         )))
-    }
-
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
     }
 }
 

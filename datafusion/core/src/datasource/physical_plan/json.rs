@@ -16,6 +16,13 @@
 // under the License.
 
 //! Execution plan for reading line-delimited JSON files
+
+use std::any::Any;
+use std::io::BufReader;
+use std::sync::Arc;
+use std::task::Poll;
+
+use super::FileScanConfig;
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
 use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::physical_plan::file_stream::{
@@ -29,26 +36,18 @@ use crate::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
 };
-use datafusion_execution::TaskContext;
 
 use arrow::json::ReaderBuilder;
 use arrow::{datatypes::SchemaRef, json};
-use datafusion_physical_expr::{
-    ordering_equivalence_properties_helper, LexOrdering, OrderingEquivalenceProperties,
-};
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
 
 use bytes::{Buf, Bytes};
 use futures::{ready, stream, StreamExt, TryStreamExt};
 use object_store;
 use object_store::{GetResultPayload, ObjectStore};
-use std::any::Any;
-use std::io::BufReader;
-use std::sync::Arc;
-use std::task::Poll;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
-
-use super::FileScanConfig;
 
 /// Execution plan for scanning NdJson data source
 #[derive(Debug, Clone)]
@@ -121,8 +120,8 @@ impl ExecutionPlan for NdJsonExec {
             .map(|ordering| ordering.as_slice())
     }
 
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        ordering_equivalence_properties_helper(
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new_with_orderings(
             self.schema(),
             &self.projected_output_ordering,
         )
@@ -163,8 +162,8 @@ impl ExecutionPlan for NdJsonExec {
         Ok(Box::pin(stream) as SendableRecordBatchStream)
     }
 
-    fn statistics(&self) -> Statistics {
-        self.projected_statistics.clone()
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self.projected_statistics.clone())
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -457,8 +456,8 @@ mod tests {
             FileScanConfig {
                 object_store_url,
                 file_groups,
+                statistics: Statistics::new_unknown(&file_schema),
                 file_schema,
-                statistics: Statistics::default(),
                 projection: None,
                 limit: Some(3),
                 table_partition_cols: vec![],
@@ -536,8 +535,8 @@ mod tests {
             FileScanConfig {
                 object_store_url,
                 file_groups,
+                statistics: Statistics::new_unknown(&file_schema),
                 file_schema,
-                statistics: Statistics::default(),
                 projection: None,
                 limit: Some(3),
                 table_partition_cols: vec![],
@@ -584,8 +583,8 @@ mod tests {
             FileScanConfig {
                 object_store_url,
                 file_groups,
+                statistics: Statistics::new_unknown(&file_schema),
                 file_schema,
-                statistics: Statistics::default(),
                 projection: Some(vec![0, 2]),
                 limit: None,
                 table_partition_cols: vec![],
@@ -637,8 +636,8 @@ mod tests {
             FileScanConfig {
                 object_store_url,
                 file_groups,
+                statistics: Statistics::new_unknown(&file_schema),
                 file_schema,
-                statistics: Statistics::default(),
                 projection: Some(vec![3, 0, 2]),
                 limit: None,
                 table_partition_cols: vec![],
@@ -675,8 +674,9 @@ mod tests {
     #[tokio::test]
     async fn write_json_results() -> Result<()> {
         // create partitioned input file and context
-        let ctx =
-            SessionContext::with_config(SessionConfig::new().with_target_partitions(8));
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(8),
+        );
 
         let path = format!("{TEST_DATA_BASE}/1.json");
 

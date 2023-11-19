@@ -21,42 +21,34 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, SchemaRef};
-use async_trait::async_trait;
-use datafusion_common::file_options::{FileTypeWriterOptions, StatementOptions};
-use datafusion_common::DataFusionError;
-use datafusion_expr::CreateExternalTable;
-
-use crate::datasource::file_format::arrow::ArrowFormat;
-use crate::datasource::file_format::avro::AvroFormat;
-use crate::datasource::file_format::csv::CsvFormat;
-use crate::datasource::file_format::file_compression_type::FileCompressionType;
-use crate::datasource::file_format::json::JsonFormat;
+#[cfg(feature = "parquet")]
 use crate::datasource::file_format::parquet::ParquetFormat;
-use crate::datasource::file_format::FileFormat;
+use crate::datasource::file_format::{
+    arrow::ArrowFormat, avro::AvroFormat, csv::CsvFormat,
+    file_compression_type::FileCompressionType, json::JsonFormat, FileFormat,
+};
 use crate::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use crate::datasource::provider::TableProviderFactory;
 use crate::datasource::TableProvider;
 use crate::execution::context::SessionState;
-use datafusion_common::FileType;
 
-use super::listing::ListingTableInsertMode;
+use arrow::datatypes::{DataType, SchemaRef};
+use datafusion_common::file_options::{FileTypeWriterOptions, StatementOptions};
+use datafusion_common::{plan_err, DataFusionError, FileType};
+use datafusion_expr::CreateExternalTable;
+
+use async_trait::async_trait;
 
 /// A `TableProviderFactory` capable of creating new `ListingTable`s
+#[derive(Debug, Default)]
 pub struct ListingTableFactory {}
 
 impl ListingTableFactory {
     /// Creates a new `ListingTableFactory`
     pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for ListingTableFactory {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -81,6 +73,7 @@ impl TableProviderFactory for ListingTableFactory {
                     .with_delimiter(cmd.delimiter as u8)
                     .with_file_compression_type(file_compression_type),
             ),
+            #[cfg(feature = "parquet")]
             FileType::PARQUET => Arc::new(ParquetFormat::default()),
             FileType::AVRO => Arc::new(AvroFormat),
             FileType::JSON => Arc::new(
@@ -154,18 +147,12 @@ impl TableProviderFactory for ListingTableFactory {
             .take_bool_option("single_file")?
             .unwrap_or(false);
 
-        let explicit_insert_mode = statement_options.take_str_option("insert_mode");
-        let insert_mode = match explicit_insert_mode {
-            Some(mode) => ListingTableInsertMode::from_str(mode.as_str()),
-            None => match file_type {
-                FileType::CSV => Ok(ListingTableInsertMode::AppendToFile),
-                FileType::PARQUET => Ok(ListingTableInsertMode::AppendNewFiles),
-                FileType::AVRO => Ok(ListingTableInsertMode::AppendNewFiles),
-                FileType::JSON => Ok(ListingTableInsertMode::AppendToFile),
-                FileType::ARROW => Ok(ListingTableInsertMode::AppendNewFiles),
-            },
-        }?;
-
+        // Backwards compatibility
+        if let Some(s) = statement_options.take_str_option("insert_mode") {
+            if !s.eq_ignore_ascii_case("append_new_files") {
+                return plan_err!("Unknown or unsupported insert mode {s}. Only append_to_file supported");
+            }
+        }
         let file_type = file_format.file_type();
 
         // Use remaining options and session state to build FileTypeWriterOptions
@@ -181,10 +168,9 @@ impl TableProviderFactory for ListingTableFactory {
             FileType::CSV => {
                 let mut csv_writer_options =
                     file_type_writer_options.try_into_csv()?.clone();
-                csv_writer_options.has_header = cmd.has_header;
                 csv_writer_options.writer_options = csv_writer_options
                     .writer_options
-                    .has_headers(cmd.has_header)
+                    .with_header(cmd.has_header)
                     .with_delimiter(cmd.delimiter.try_into().map_err(|_| {
                         DataFusionError::Internal(
                             "Unable to convert CSV delimiter into u8".into(),
@@ -199,6 +185,7 @@ impl TableProviderFactory for ListingTableFactory {
                 json_writer_options.compression = cmd.file_compression_type;
                 FileTypeWriterOptions::JSON(json_writer_options)
             }
+            #[cfg(feature = "parquet")]
             FileType::PARQUET => file_type_writer_options,
             FileType::ARROW => file_type_writer_options,
             FileType::AVRO => file_type_writer_options,
@@ -218,7 +205,6 @@ impl TableProviderFactory for ListingTableFactory {
             .with_target_partitions(state.config().target_partitions())
             .with_table_partition_cols(table_partition_cols)
             .with_file_sort_order(cmd.order_exprs.clone())
-            .with_insert_mode(insert_mode)
             .with_single_file(single_file)
             .with_write_options(file_type_writer_options)
             .with_infinite_source(unbounded);
@@ -232,7 +218,9 @@ impl TableProviderFactory for ListingTableFactory {
             .with_schema(resolved_schema);
         let provider = ListingTable::try_new(config)?
             .with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
-        let table = provider.with_definition(cmd.definition.clone());
+        let table = provider
+            .with_definition(cmd.definition.clone())
+            .with_constraints(cmd.constraints.clone());
         Ok(Arc::new(table))
     }
 }
@@ -248,13 +236,13 @@ fn get_extension(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::HashMap;
 
+    use super::*;
     use crate::execution::context::SessionContext;
+
     use datafusion_common::parsers::CompressionTypeVariant;
-    use datafusion_common::{DFSchema, OwnedTableReference};
+    use datafusion_common::{Constraints, DFSchema, OwnedTableReference};
 
     #[tokio::test]
     async fn test_create_using_non_std_file_ext() {
@@ -282,6 +270,7 @@ mod tests {
             order_exprs: vec![],
             unbounded: false,
             options: HashMap::new(),
+            constraints: Constraints::empty(),
         };
         let table_provider = factory.create(&state, &cmd).await.unwrap();
         let listing_table = table_provider

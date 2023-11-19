@@ -24,18 +24,24 @@ use crate::protobuf::{
     arrow_type::ArrowTypeEnum,
     plan_type::PlanTypeEnum::{
         AnalyzedLogicalPlan, FinalAnalyzedLogicalPlan, FinalLogicalPlan,
-        FinalPhysicalPlan, InitialLogicalPlan, InitialPhysicalPlan, OptimizedLogicalPlan,
+        FinalPhysicalPlan, FinalPhysicalPlanWithStats, InitialLogicalPlan,
+        InitialPhysicalPlan, InitialPhysicalPlanWithStats, OptimizedLogicalPlan,
         OptimizedPhysicalPlan,
     },
     AnalyzedLogicalPlanType, CubeNode, EmptyMessage, GroupingSetNode, LogicalExprList,
     OptimizedLogicalPlanType, OptimizedPhysicalPlanType, PlaceholderNode, RollupNode,
 };
-use arrow::datatypes::{
-    DataType, Field, IntervalMonthDayNanoType, IntervalUnit, Schema, SchemaRef, TimeUnit,
-    UnionMode,
+use arrow::{
+    datatypes::{
+        DataType, Field, IntervalMonthDayNanoType, IntervalUnit, Schema, SchemaRef,
+        TimeUnit, UnionMode,
+    },
+    ipc::writer::{DictionaryTracker, IpcDataGenerator},
+    record_batch::RecordBatch,
 };
 use datafusion_common::{
-    Column, DFField, DFSchema, DFSchemaRef, OwnedTableReference, ScalarValue,
+    Column, Constraint, Constraints, DFField, DFSchema, DFSchemaRef, OwnedTableReference,
+    ScalarValue,
 };
 use datafusion_expr::expr::{
     self, Alias, Between, BinaryExpr, Cast, GetFieldAccess, GetIndexedField, GroupingSet,
@@ -50,13 +56,6 @@ use datafusion_expr::{
 #[derive(Debug)]
 pub enum Error {
     General(String),
-
-    InconsistentListTyping(DataType, DataType),
-
-    InconsistentListDesignated {
-        value: ScalarValue,
-        designated: DataType,
-    },
 
     InvalidScalarValue(ScalarValue),
 
@@ -75,18 +74,6 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::General(desc) => write!(f, "General error: {desc}"),
-            Self::InconsistentListTyping(type1, type2) => {
-                write!(
-                    f,
-                    "Lists with inconsistent typing; {type1:?} and {type2:?} found within list",
-                )
-            }
-            Self::InconsistentListDesignated { value, designated } => {
-                write!(
-                    f,
-                    "Value {value:?} was inconsistent with designated type {designated:?}"
-                )
-            }
             Self::InvalidScalarValue(value) => {
                 write!(f, "{value:?} is invalid as a DataFusion scalar value")
             }
@@ -366,6 +353,12 @@ impl From<&StringifiedPlan> for protobuf::StringifiedPlan {
                 PlanType::FinalPhysicalPlan => Some(protobuf::PlanType {
                     plan_type_enum: Some(FinalPhysicalPlan(EmptyMessage {})),
                 }),
+                PlanType::InitialPhysicalPlanWithStats => Some(protobuf::PlanType {
+                    plan_type_enum: Some(InitialPhysicalPlanWithStats(EmptyMessage {})),
+                }),
+                PlanType::FinalPhysicalPlanWithStats => Some(protobuf::PlanType {
+                    plan_type_enum: Some(FinalPhysicalPlanWithStats(EmptyMessage {})),
+                }),
             },
             plan: stringified_plan.plan.to_string(),
         }
@@ -412,6 +405,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
             AggregateFunction::Median => Self::Median,
             AggregateFunction::FirstValue => Self::FirstValueAgg,
             AggregateFunction::LastValue => Self::LastValueAgg,
+            AggregateFunction::StringAgg => Self::StringAgg,
         }
     }
 }
@@ -490,9 +484,17 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
             Expr::Column(c) => Self {
                 expr_type: Some(ExprType::Column(c.into())),
             },
-            Expr::Alias(Alias { expr, name, .. }) => {
+            Expr::Alias(Alias {
+                expr,
+                relation,
+                name,
+            }) => {
                 let alias = Box::new(protobuf::AliasNode {
                     expr: Some(Box::new(expr.as_ref().try_into()?)),
+                    relation: relation
+                        .to_owned()
+                        .map(|r| vec![r.into()])
+                        .unwrap_or(vec![]),
                     alias: name.to_owned(),
                 });
                 Self {
@@ -612,12 +614,12 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     }
                     WindowFunction::AggregateUDF(aggr_udf) => {
                         protobuf::window_expr_node::WindowFunction::Udaf(
-                            aggr_udf.name.clone(),
+                            aggr_udf.name().to_string(),
                         )
                     }
                     WindowFunction::WindowUDF(window_udf) => {
                         protobuf::window_expr_node::WindowFunction::Udwf(
-                            window_udf.name.clone(),
+                            window_udf.name().to_string(),
                         )
                     }
                 };
@@ -720,6 +722,9 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     AggregateFunction::LastValue => {
                         protobuf::AggregateFunction::LastValueAgg
                     }
+                    AggregateFunction::StringAgg => {
+                        protobuf::AggregateFunction::StringAgg
+                    }
                 };
 
                 let aggregate_expr = protobuf::AggregateExprNode {
@@ -768,7 +773,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
             }
             Expr::ScalarUDF(ScalarUDF { fun, args }) => Self {
                 expr_type: Some(ExprType::ScalarUdfExpr(protobuf::ScalarUdfExprNode {
-                    fun_name: fun.name.clone(),
+                    fun_name: fun.name().to_string(),
                     args: args
                         .iter()
                         .map(|expr| expr.try_into())
@@ -783,7 +788,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
             }) => Self {
                 expr_type: Some(ExprType::AggregateUdfExpr(Box::new(
                     protobuf::AggregateUdfExprNode {
-                        fun_name: fun.name.clone(),
+                        fun_name: fun.name().to_string(),
                         args: args.iter().map(|expr| expr.try_into()).collect::<Result<
                             Vec<_>,
                             Error,
@@ -974,8 +979,10 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     expr_type: Some(ExprType::InList(expr)),
                 }
             }
-            Expr::Wildcard => Self {
-                expr_type: Some(ExprType::Wildcard(true)),
+            Expr::Wildcard { qualifier } => Self {
+                expr_type: Some(ExprType::Wildcard(protobuf::Wildcard {
+                    qualifier: qualifier.clone(),
+                })),
             },
             Expr::ScalarSubquery(_)
             | Expr::InSubquery(_)
@@ -1066,11 +1073,6 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     })),
                 }
             }
-
-            Expr::QualifiedWildcard { .. } => return Err(Error::General(
-                "Proto serialization error: Expr::QualifiedWildcard { .. } not supported"
-                    .to_string(),
-            )),
         };
 
         Ok(expr_node)
@@ -1136,33 +1138,49 @@ impl TryFrom<&ScalarValue> for protobuf::ScalarValue {
                     Value::LargeUtf8Value(s.to_owned())
                 })
             }
-            ScalarValue::Fixedsizelist(..) => Err(Error::General(
-                "Proto serialization error: ScalarValue::Fixedsizelist not supported"
-                    .to_string(),
-            )),
-            ScalarValue::List(values, boxed_field) => {
-                let is_null = values.is_none();
+            // ScalarValue::List and ScalarValue::FixedSizeList are serialized using
+            // Arrow IPC messages as a single column RecordBatch
+            ScalarValue::List(arr) | ScalarValue::FixedSizeList(arr) => {
+                // Wrap in a "field_name" column
+                let batch = RecordBatch::try_from_iter(vec![(
+                    "field_name",
+                    arr.to_owned(),
+                )])
+                .map_err(|e| {
+                   Error::General( format!("Error creating temporary batch while encoding ScalarValue::List: {e}"))
+                })?;
 
-                let values = if let Some(values) = values.as_ref() {
-                    values
-                        .iter()
-                        .map(|v| v.try_into())
-                        .collect::<Result<Vec<protobuf::ScalarValue>, _>>()?
-                } else {
-                    vec![]
+                let gen = IpcDataGenerator {};
+                let mut dict_tracker = DictionaryTracker::new(false);
+                let (_, encoded_message) = gen
+                    .encoded_batch(&batch, &mut dict_tracker, &Default::default())
+                    .map_err(|e| {
+                        Error::General(format!(
+                            "Error encoding ScalarValue::List as IPC: {e}"
+                        ))
+                    })?;
+
+                let schema: protobuf::Schema = batch.schema().try_into()?;
+
+                let scalar_list_value = protobuf::ScalarListValue {
+                    ipc_message: encoded_message.ipc_message,
+                    arrow_data: encoded_message.arrow_data,
+                    schema: Some(schema),
                 };
 
-                let field = boxed_field.as_ref().try_into()?;
-
-                Ok(protobuf::ScalarValue {
-                    value: Some(protobuf::scalar_value::Value::ListValue(
-                        protobuf::ScalarListValue {
-                            is_null,
-                            field: Some(field),
-                            values,
-                        },
-                    )),
-                })
+                match val {
+                    ScalarValue::List(_) => Ok(protobuf::ScalarValue {
+                        value: Some(protobuf::scalar_value::Value::ListValue(
+                            scalar_list_value,
+                        )),
+                    }),
+                    ScalarValue::FixedSizeList(_) => Ok(protobuf::ScalarValue {
+                        value: Some(protobuf::scalar_value::Value::FixedSizeListValue(
+                            scalar_list_value,
+                        )),
+                    }),
+                    _ => unreachable!(),
+                }
             }
             ScalarValue::Date32(val) => {
                 create_proto_scalar(val.as_ref(), &data_type, |s| Value::Date32Value(*s))
@@ -1462,6 +1480,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::ArrayAppend => Self::ArrayAppend,
             BuiltinScalarFunction::ArrayConcat => Self::ArrayConcat,
             BuiltinScalarFunction::ArrayEmpty => Self::ArrayEmpty,
+            BuiltinScalarFunction::ArrayExcept => Self::ArrayExcept,
             BuiltinScalarFunction::ArrayHasAll => Self::ArrayHasAll,
             BuiltinScalarFunction::ArrayHasAny => Self::ArrayHasAny,
             BuiltinScalarFunction::ArrayHas => Self::ArrayHas,
@@ -1470,6 +1489,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Flatten => Self::Flatten,
             BuiltinScalarFunction::ArrayLength => Self::ArrayLength,
             BuiltinScalarFunction::ArrayNdims => Self::ArrayNdims,
+            BuiltinScalarFunction::ArrayPopFront => Self::ArrayPopFront,
             BuiltinScalarFunction::ArrayPopBack => Self::ArrayPopBack,
             BuiltinScalarFunction::ArrayPosition => Self::ArrayPosition,
             BuiltinScalarFunction::ArrayPositions => Self::ArrayPositions,
@@ -1483,6 +1503,9 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::ArrayReplaceAll => Self::ArrayReplaceAll,
             BuiltinScalarFunction::ArraySlice => Self::ArraySlice,
             BuiltinScalarFunction::ArrayToString => Self::ArrayToString,
+            BuiltinScalarFunction::ArrayIntersect => Self::ArrayIntersect,
+            BuiltinScalarFunction::ArrayUnion => Self::ArrayUnion,
+            BuiltinScalarFunction::Range => Self::Range,
             BuiltinScalarFunction::Cardinality => Self::Cardinality,
             BuiltinScalarFunction::MakeArray => Self::Array,
             BuiltinScalarFunction::NullIf => Self::NullIf,
@@ -1524,6 +1547,7 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Substr => Self::Substr,
             BuiltinScalarFunction::ToHex => Self::ToHex,
             BuiltinScalarFunction::ToTimestampMicros => Self::ToTimestampMicros,
+            BuiltinScalarFunction::ToTimestampNanos => Self::ToTimestampNanos,
             BuiltinScalarFunction::ToTimestampSeconds => Self::ToTimestampSeconds,
             BuiltinScalarFunction::Now => Self::Now,
             BuiltinScalarFunction::CurrentDate => Self::CurrentDate,
@@ -1540,6 +1564,8 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Isnan => Self::Isnan,
             BuiltinScalarFunction::Iszero => Self::Iszero,
             BuiltinScalarFunction::ArrowTypeof => Self::ArrowTypeof,
+            BuiltinScalarFunction::OverLay => Self::OverLay,
+            BuiltinScalarFunction::Levenshtein => Self::Levenshtein,
         };
 
         Ok(scalar_function)
@@ -1619,6 +1645,35 @@ impl From<JoinConstraint> for protobuf::JoinConstraint {
         match t {
             JoinConstraint::On => protobuf::JoinConstraint::On,
             JoinConstraint::Using => protobuf::JoinConstraint::Using,
+        }
+    }
+}
+
+impl From<Constraints> for protobuf::Constraints {
+    fn from(value: Constraints) -> Self {
+        let constraints = value.into_iter().map(|item| item.into()).collect();
+        protobuf::Constraints { constraints }
+    }
+}
+
+impl From<Constraint> for protobuf::Constraint {
+    fn from(value: Constraint) -> Self {
+        let res = match value {
+            Constraint::PrimaryKey(indices) => {
+                let indices = indices.into_iter().map(|item| item as u64).collect();
+                protobuf::constraint::ConstraintMode::PrimaryKey(
+                    protobuf::PrimaryKeyConstraint { indices },
+                )
+            }
+            Constraint::Unique(indices) => {
+                let indices = indices.into_iter().map(|item| item as u64).collect();
+                protobuf::constraint::ConstraintMode::PrimaryKey(
+                    protobuf::PrimaryKeyConstraint { indices },
+                )
+            }
+        };
+        protobuf::Constraint {
+            constraint_mode: Some(res),
         }
     }
 }

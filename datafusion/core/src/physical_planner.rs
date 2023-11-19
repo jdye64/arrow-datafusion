@@ -17,16 +17,21 @@
 
 //! Planner for [`LogicalPlan`] to [`ExecutionPlan`]
 
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::sync::Arc;
+
 use crate::datasource::file_format::arrow::ArrowFormat;
 use crate::datasource::file_format::avro::AvroFormat;
 use crate::datasource::file_format::csv::CsvFormat;
 use crate::datasource::file_format::json::JsonFormat;
+#[cfg(feature = "parquet")]
 use crate::datasource::file_format::parquet::ParquetFormat;
-use crate::datasource::file_format::write::FileWriterMode;
 use crate::datasource::file_format::FileFormat;
 use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::physical_plan::FileSinkConfig;
 use crate::datasource::source_as_provider;
+use crate::error::{DataFusionError, Result};
 use crate::execution::context::{ExecutionProps, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_expr::{
@@ -37,49 +42,45 @@ use crate::logical_expr::{
     CrossJoin, Expr, LogicalPlan, Partitioning as LogicalPartitioning, PlanType,
     Repartition, Union, UserDefinedLogicalNode,
 };
-use crate::physical_plan::memory::MemoryExec;
-use arrow_array::builder::StringBuilder;
-use arrow_array::RecordBatch;
-use datafusion_common::display::ToStringifiedPlan;
-use datafusion_common::file_options::FileTypeWriterOptions;
-use datafusion_common::FileType;
-use datafusion_expr::dml::{CopyOptions, CopyTo};
-
 use crate::logical_expr::{Limit, Values};
 use crate::physical_expr::create_physical_expr;
 use crate::physical_optimizer::optimizer::PhysicalOptimizerRule;
 use crate::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use crate::physical_plan::analyze::AnalyzeExec;
+use crate::physical_plan::empty::EmptyExec;
 use crate::physical_plan::explain::ExplainExec;
 use crate::physical_plan::expressions::{Column, PhysicalSortExpr};
 use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::joins::HashJoinExec;
-use crate::physical_plan::joins::SortMergeJoinExec;
-use crate::physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
+use crate::physical_plan::joins::utils as join_utils;
+use crate::physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+};
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use crate::physical_plan::memory::MemoryExec;
 use crate::physical_plan::projection::ProjectionExec;
 use crate::physical_plan::repartition::RepartitionExec;
 use crate::physical_plan::sorts::sort::SortExec;
+use crate::physical_plan::union::UnionExec;
 use crate::physical_plan::unnest::UnnestExec;
+use crate::physical_plan::values::ValuesExec;
 use crate::physical_plan::windows::{
     BoundedWindowAggExec, PartitionSearchMode, WindowAggExec,
 };
 use crate::physical_plan::{
-    aggregates, empty::EmptyExec, joins::PartitionMode, udaf, union::UnionExec,
-    values::ValuesExec, windows,
+    aggregates, displayable, udaf, windows, AggregateExpr, ExecutionPlan, Partitioning,
+    PhysicalExpr, WindowExpr,
 };
-use crate::physical_plan::{joins::utils as join_utils, Partitioning};
-use crate::physical_plan::{AggregateExpr, ExecutionPlan, PhysicalExpr, WindowExpr};
-use crate::{
-    error::{DataFusionError, Result},
-    physical_plan::displayable,
-};
+
 use arrow::compute::SortOptions;
 use arrow::datatypes::{Schema, SchemaRef};
-use async_trait::async_trait;
+use arrow_array::builder::StringBuilder;
+use arrow_array::RecordBatch;
+use datafusion_common::display::ToStringifiedPlan;
+use datafusion_common::file_options::FileTypeWriterOptions;
 use datafusion_common::{
-    exec_err, internal_err, not_impl_err, plan_err, DFSchema, ScalarValue,
+    exec_err, internal_err, not_impl_err, plan_err, DFSchema, FileType, ScalarValue,
 };
+use datafusion_expr::dml::{CopyOptions, CopyTo};
 use datafusion_expr::expr::{
     self, AggregateFunction, AggregateUDF, Alias, Between, BinaryExpr, Cast,
     GetFieldAccess, GetIndexedField, GroupingSet, InList, Like, ScalarUDF, TryCast,
@@ -87,17 +88,17 @@ use datafusion_expr::expr::{
 };
 use datafusion_expr::expr_rewriter::{unalias, unnormalize_cols};
 use datafusion_expr::logical_plan::builder::wrap_projection_for_join_if_necessary;
-use datafusion_expr::{DescribeTable, DmlStatement, StringifiedPlan, WriteOp};
-use datafusion_expr::{WindowFrame, WindowFrameBound};
+use datafusion_expr::{
+    DescribeTable, DmlStatement, StringifiedPlan, WindowFrame, WindowFrameBound, WriteOp,
+};
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_sql::utils::window_expr_common_partition_keys;
+
+use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::{multiunzip, Itertools};
 use log::{debug, trace};
-use std::collections::HashMap;
-use std::fmt::Write;
-use std::sync::Arc;
 
 fn create_function_physical_name(
     fun: &str,
@@ -220,7 +221,7 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             create_function_physical_name(&func.fun.to_string(), false, &func.args)
         }
         Expr::ScalarUDF(ScalarUDF { fun, args }) => {
-            create_function_physical_name(&fun.name, false, args)
+            create_function_physical_name(fun.name(), false, args)
         }
         Expr::WindowFunction(WindowFunction { fun, args, .. }) => {
             create_function_physical_name(&fun.to_string(), false, args)
@@ -248,7 +249,7 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             for e in args {
                 names.push(create_physical_name(e, false)?);
             }
-            Ok(format!("{}({})", fun.name, names.join(",")))
+            Ok(format!("{}({})", fun.name(), names.join(",")))
         }
         Expr::GroupingSet(grouping_set) => match grouping_set {
             GroupingSet::Rollup(exprs) => Ok(format!(
@@ -362,9 +363,8 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
         Expr::Sort { .. } => {
             internal_err!("Create physical name does not support sort expression")
         }
-        Expr::Wildcard => internal_err!("Create physical name does not support wildcard"),
-        Expr::QualifiedWildcard { .. } => {
-            internal_err!("Create physical name does not support qualified wildcard")
+        Expr::Wildcard { .. } => {
+            internal_err!("Create physical name does not support wildcard")
         }
         Expr::Placeholder(_) => {
             internal_err!("Create physical name does not support placeholder")
@@ -590,7 +590,6 @@ impl DefaultPhysicalPlanner {
                         output_schema: Arc::new(schema),
                         table_partition_cols: vec![],
                         unbounded_input: false,
-                        writer_mode: FileWriterMode::PutMultipart,
                         single_file_output: *single_file_output,
                         overwrite: false,
                         file_type_writer_options
@@ -598,13 +597,14 @@ impl DefaultPhysicalPlanner {
 
                     let sink_format: Arc<dyn FileFormat> = match file_format {
                         FileType::CSV => Arc::new(CsvFormat::default()),
+                        #[cfg(feature = "parquet")]
                         FileType::PARQUET => Arc::new(ParquetFormat::default()),
                         FileType::JSON => Arc::new(JsonFormat::default()),
                         FileType::AVRO => Arc::new(AvroFormat {} ),
                         FileType::ARROW => Arc::new(ArrowFormat {}),
                     };
 
-                    sink_format.create_writer_physical_plan(input_exec, session_state, config).await
+                    sink_format.create_writer_physical_plan(input_exec, session_state, config, None).await
                 }
                 LogicalPlan::Dml(DmlStatement {
                     table_name,
@@ -751,7 +751,6 @@ impl DefaultPhysicalPlanner {
                         Arc::new(BoundedWindowAggExec::try_new(
                             window_expr,
                             input_exec,
-                            physical_input_schema,
                             physical_partition_keys,
                             PartitionSearchMode::Sorted,
                         )?)
@@ -759,7 +758,6 @@ impl DefaultPhysicalPlanner {
                         Arc::new(WindowAggExec::try_new(
                             window_expr,
                             input_exec,
-                            physical_input_schema,
                             physical_partition_keys,
                         )?)
                     })
@@ -820,16 +818,13 @@ impl DefaultPhysicalPlanner {
                     let updated_aggregates = initial_aggr.aggr_expr().to_vec();
                     let updated_order_bys = initial_aggr.order_by_expr().to_vec();
 
-                    let (initial_aggr, next_partition_mode): (
-                        Arc<dyn ExecutionPlan>,
-                        AggregateMode,
-                    ) = if can_repartition {
+                    let next_partition_mode = if can_repartition {
                         // construct a second aggregation with 'AggregateMode::FinalPartitioned'
-                        (initial_aggr, AggregateMode::FinalPartitioned)
+                        AggregateMode::FinalPartitioned
                     } else {
                         // construct a second aggregation, keeping the final column name equal to the
                         // first aggregation and the expressions corresponding to the respective aggregate
-                        (initial_aggr, AggregateMode::Final)
+                        AggregateMode::Final
                     };
 
                     let final_grouping_set = PhysicalGroupBy::new_single(
@@ -1251,10 +1246,10 @@ impl DefaultPhysicalPlanner {
                         "Unsupported logical plan: Prepare"
                     )
                 }
-                LogicalPlan::Dml(_) => {
+                LogicalPlan::Dml(dml) => {
                     // DataFusion is a read-only query engine, but also a library, so consumers may implement this
                     not_impl_err!(
-                        "Unsupported logical plan: Dml"
+                        "Unsupported logical plan: Dml({0})", dml.op
                     )
                 }
                 LogicalPlan::Statement(statement) => {
@@ -1893,11 +1888,24 @@ impl DefaultPhysicalPlanner {
                     .await
                 {
                     Ok(input) => {
+                        // This plan will includes statistics if show_statistics is on
                         stringified_plans.push(
                             displayable(input.as_ref())
                                 .set_show_statistics(config.show_statistics)
                                 .to_stringified(e.verbose, InitialPhysicalPlan),
                         );
+
+                        // If the show_statisitcs is off, add another line to show statsitics in the case of explain verbose
+                        if e.verbose && !config.show_statistics {
+                            stringified_plans.push(
+                                displayable(input.as_ref())
+                                    .set_show_statistics(true)
+                                    .to_stringified(
+                                        e.verbose,
+                                        InitialPhysicalPlanWithStats,
+                                    ),
+                            );
+                        }
 
                         match self.optimize_internal(
                             input,
@@ -1912,11 +1920,26 @@ impl DefaultPhysicalPlanner {
                                 );
                             },
                         ) {
-                            Ok(input) => stringified_plans.push(
-                                displayable(input.as_ref())
-                                    .set_show_statistics(config.show_statistics)
-                                    .to_stringified(e.verbose, FinalPhysicalPlan),
-                            ),
+                            Ok(input) => {
+                                // This plan will includes statistics if show_statistics is on
+                                stringified_plans.push(
+                                    displayable(input.as_ref())
+                                        .set_show_statistics(config.show_statistics)
+                                        .to_stringified(e.verbose, FinalPhysicalPlan),
+                                );
+
+                                // If the show_statisitcs is off, add another line to show statsitics in the case of explain verbose
+                                if e.verbose && !config.show_statistics {
+                                    stringified_plans.push(
+                                        displayable(input.as_ref())
+                                            .set_show_statistics(true)
+                                            .to_stringified(
+                                                e.verbose,
+                                                FinalPhysicalPlanWithStats,
+                                            ),
+                                    );
+                                }
+                            }
                             Err(DataFusionError::Context(optimizer_name, e)) => {
                                 let plan_type = OptimizedPhysicalPlan { optimizer_name };
                                 stringified_plans
@@ -2058,9 +2081,7 @@ mod tests {
     use super::*;
     use crate::datasource::file_format::options::CsvReadOptions;
     use crate::datasource::MemTable;
-    use crate::physical_plan::{
-        expressions, DisplayFormatType, Partitioning, Statistics,
-    };
+    use crate::physical_plan::{expressions, DisplayFormatType, Partitioning};
     use crate::physical_plan::{DisplayAs, SendableRecordBatchStream};
     use crate::physical_planner::PhysicalPlanner;
     use crate::prelude::{SessionConfig, SessionContext};
@@ -2087,7 +2108,7 @@ mod tests {
         let runtime = Arc::new(RuntimeEnv::default());
         let config = SessionConfig::new().with_target_partitions(4);
         let config = config.set_bool("datafusion.optimizer.skip_failed_rules", false);
-        SessionState::with_config_rt(config, runtime)
+        SessionState::new_with_config_rt(config, runtime)
     }
 
     async fn plan(logical_plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
@@ -2670,10 +2691,6 @@ mod tests {
             _context: Arc<TaskContext>,
         ) -> Result<SendableRecordBatchStream> {
             unimplemented!("NoOpExecutionPlan::execute");
-        }
-
-        fn statistics(&self) -> Statistics {
-            unimplemented!("NoOpExecutionPlan::statistics");
         }
     }
 

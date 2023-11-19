@@ -18,6 +18,8 @@
 use async_recursion::async_recursion;
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::{not_impl_err, DFField, DFSchema, DFSchemaRef};
+
+use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::{
     aggregate_function, window_function::find_df_window_func, BinaryExpr,
     BuiltinScalarFunction, Case, Expr, LogicalPlan, Operator,
@@ -77,6 +79,10 @@ enum ScalarFunctionType {
     Like,
     /// [Expr::Like] Case insensitive operator counterpart of `Like`
     ILike,
+    /// [Expr::IsNull]
+    IsNull,
+    /// [Expr::IsNotNull]
+    IsNotNull,
 }
 
 pub fn name_to_op(name: &str) -> Result<Operator> {
@@ -125,13 +131,60 @@ fn scalar_function_type_from_str(name: &str) -> Result<ScalarFunctionType> {
         "not" => Ok(ScalarFunctionType::Not),
         "like" => Ok(ScalarFunctionType::Like),
         "ilike" => Ok(ScalarFunctionType::ILike),
+        "is_null" => Ok(ScalarFunctionType::IsNull),
+        "is_not_null" => Ok(ScalarFunctionType::IsNotNull),
         others => not_impl_err!("Unsupported function name: {others:?}"),
     }
 }
 
+fn split_eq_and_noneq_join_predicate_with_nulls_equality(
+    filter: &Expr,
+) -> (Vec<(Column, Column)>, bool, Option<Expr>) {
+    let exprs = split_conjunction(filter);
+
+    let mut accum_join_keys: Vec<(Column, Column)> = vec![];
+    let mut accum_filters: Vec<Expr> = vec![];
+    let mut nulls_equal_nulls = false;
+
+    for expr in exprs {
+        match expr {
+            Expr::BinaryExpr(binary_expr) => match binary_expr {
+                x @ (BinaryExpr {
+                    left,
+                    op: Operator::Eq,
+                    right,
+                }
+                | BinaryExpr {
+                    left,
+                    op: Operator::IsNotDistinctFrom,
+                    right,
+                }) => {
+                    nulls_equal_nulls = match x.op {
+                        Operator::Eq => false,
+                        Operator::IsNotDistinctFrom => true,
+                        _ => unreachable!(),
+                    };
+
+                    match (left.as_ref(), right.as_ref()) {
+                        (Expr::Column(l), Expr::Column(r)) => {
+                            accum_join_keys.push((l.clone(), r.clone()));
+                        }
+                        _ => accum_filters.push(expr.clone()),
+                    }
+                }
+                _ => accum_filters.push(expr.clone()),
+            },
+            _ => accum_filters.push(expr.clone()),
+        }
+    }
+
+    let join_filter = accum_filters.into_iter().reduce(Expr::and);
+    (accum_join_keys, nulls_equal_nulls, join_filter)
+}
+
 /// Convert Substrait Plan to DataFusion DataFrame
 pub async fn from_substrait_plan(
-    ctx: &mut SessionContext,
+    ctx: &SessionContext,
     plan: &Plan,
 ) -> Result<LogicalPlan> {
     // Register function extension
@@ -173,7 +226,7 @@ pub async fn from_substrait_plan(
 /// Convert Substrait Rel to DataFusion DataFrame
 #[async_recursion]
 pub async fn from_substrait_rel(
-    ctx: &mut SessionContext,
+    ctx: &SessionContext,
     rel: &Rel,
     extensions: &HashMap<u32, &String>,
 ) -> Result<LogicalPlan> {
@@ -313,6 +366,7 @@ pub async fn from_substrait_rel(
                                 _ => false,
                             };
                             from_substrait_agg_func(
+                                ctx,
                                 f,
                                 input.schema(),
                                 extensions,
@@ -336,7 +390,13 @@ pub async fn from_substrait_rel(
             }
         }
         Some(RelType::Join(join)) => {
-            let left = LogicalPlanBuilder::from(
+            if join.post_join_filter.is_some() {
+                return not_impl_err!(
+                    "JoinRel with post_join_filter is not yet supported"
+                );
+            }
+
+            let left: LogicalPlanBuilder = LogicalPlanBuilder::from(
                 from_substrait_rel(ctx, join.left.as_ref().unwrap(), extensions).await?,
             );
             let right = LogicalPlanBuilder::from(
@@ -346,65 +406,32 @@ pub async fn from_substrait_rel(
             // The join condition expression needs full input schema and not the output schema from join since we lose columns from
             // certain join types such as semi and anti joins
             let in_join_schema = left.schema().join(right.schema())?;
-            // Parse post join filter if exists
-            let join_filter = match &join.post_join_filter {
-                Some(filter) => {
-                    let parsed_filter =
-                        from_substrait_rex(filter, &in_join_schema, extensions).await?;
-                    Some(parsed_filter.as_ref().clone())
-                }
-                None => None,
-            };
+
             // If join expression exists, parse the `on` condition expression, build join and return
-            // Otherwise, build join with koin filter, without join keys
+            // Otherwise, build join with only the filter, without join keys
             match &join.expression.as_ref() {
                 Some(expr) => {
                     let on =
                         from_substrait_rex(expr, &in_join_schema, extensions).await?;
-                    let predicates = split_conjunction(&on);
-                    // TODO: collect only one null_eq_null
-                    let join_exprs: Vec<(Column, Column, bool)> = predicates
-                        .iter()
-                        .map(|p| match p {
-                            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                                match (left.as_ref(), right.as_ref()) {
-                                    (Expr::Column(l), Expr::Column(r)) => match op {
-                                        Operator::Eq => Ok((l.clone(), r.clone(), false)),
-                                        Operator::IsNotDistinctFrom => {
-                                            Ok((l.clone(), r.clone(), true))
-                                        }
-                                        _ => plan_err!("invalid join condition op"),
-                                    },
-                                    _ => plan_err!("invalid join condition expression"),
-                                }
-                            }
-                            _ => plan_err!(
-                                "Non-binary expression is not supported in join condition"
-                            ),
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let (left_cols, right_cols, null_eq_nulls): (Vec<_>, Vec<_>, Vec<_>) =
-                        itertools::multiunzip(join_exprs);
+                    // The join expression can contain both equal and non-equal ops.
+                    // As of datafusion 31.0.0, the equal and non equal join conditions are in separate fields.
+                    // So we extract each part as follows:
+                    // - If an Eq or IsNotDistinctFrom op is encountered, add the left column, right column and is_null_equal_nulls to `join_ons` vector
+                    // - Otherwise we add the expression to join_filter (use conjunction if filter already exists)
+                    let (join_ons, nulls_equal_nulls, join_filter) =
+                        split_eq_and_noneq_join_predicate_with_nulls_equality(&on);
+                    let (left_cols, right_cols): (Vec<_>, Vec<_>) =
+                        itertools::multiunzip(join_ons);
                     left.join_detailed(
                         right.build()?,
                         join_type,
                         (left_cols, right_cols),
                         join_filter,
-                        null_eq_nulls[0],
+                        nulls_equal_nulls,
                     )?
                     .build()
                 }
-                None => match &join_filter {
-                    Some(_) => left
-                        .join(
-                            right.build()?,
-                            join_type,
-                            (Vec::<Column>::new(), Vec::<Column>::new()),
-                            join_filter,
-                        )?
-                        .build(),
-                    None => plan_err!("Join without join keys require a valid filter"),
-                },
+                None => plan_err!("JoinRel without join condition is not allowed"),
             }
         }
         Some(RelType::Read(read)) => match &read.as_ref().read_type {
@@ -461,8 +488,8 @@ pub async fn from_substrait_rel(
             }
             _ => not_impl_err!("Only NamedTable reads are supported"),
         },
-        Some(RelType::Set(set)) => match set_rel::SetOp::from_i32(set.op) {
-            Some(set_op) => match set_op {
+        Some(RelType::Set(set)) => match set_rel::SetOp::try_from(set.op) {
+            Ok(set_op) => match set_op {
                 set_rel::SetOp::UnionAll => {
                     if !set.inputs.is_empty() {
                         let mut union_builder = Ok(LogicalPlanBuilder::from(
@@ -479,7 +506,7 @@ pub async fn from_substrait_rel(
                 }
                 _ => not_impl_err!("Unsupported set operator: {set_op:?}"),
             },
-            None => not_impl_err!("Invalid set operation type None"),
+            Err(e) => not_impl_err!("Invalid set operation type {}: {e}", set.op),
         },
         Some(RelType::ExtensionLeaf(extension)) => {
             let Some(ext_detail) = &extension.detail else {
@@ -535,7 +562,7 @@ pub async fn from_substrait_rel(
 }
 
 fn from_substrait_jointype(join_type: i32) -> Result<JoinType> {
-    if let Some(substrait_join_type) = join_rel::JoinType::from_i32(join_type) {
+    if let Ok(substrait_join_type) = join_rel::JoinType::try_from(join_type) {
         match substrait_join_type {
             join_rel::JoinType::Inner => Ok(JoinType::Inner),
             join_rel::JoinType::Left => Ok(JoinType::Left),
@@ -563,7 +590,7 @@ pub async fn from_substrait_sorts(
         let asc_nullfirst = match &s.sort_kind {
             Some(k) => match k {
                 Direction(d) => {
-                    let Some(direction) = SortDirection::from_i32(*d) else {
+                    let Ok(direction) = SortDirection::try_from(*d) else {
                         return not_impl_err!(
                             "Unsupported Substrait SortDirection value {d}"
                         );
@@ -635,6 +662,7 @@ pub async fn from_substriat_func_args(
 
 /// Convert Substrait AggregateFunction to DataFusion Expr
 pub async fn from_substrait_agg_func(
+    ctx: &SessionContext,
     f: &AggregateFunction,
     input_schema: &DFSchema,
     extensions: &HashMap<u32, &String>,
@@ -655,23 +683,37 @@ pub async fn from_substrait_agg_func(
         args.push(arg_expr?.as_ref().clone());
     }
 
-    let fun = match extensions.get(&f.function_reference) {
-        Some(function_name) => {
-            aggregate_function::AggregateFunction::from_str(function_name)
-        }
-        None => not_impl_err!(
-            "Aggregated function not found: function anchor = {:?}",
+    let Some(function_name) = extensions.get(&f.function_reference) else {
+        return plan_err!(
+            "Aggregate function not registered: function anchor = {:?}",
             f.function_reference
-        ),
+        );
     };
 
-    Ok(Arc::new(Expr::AggregateFunction(expr::AggregateFunction {
-        fun: fun.unwrap(),
-        args,
-        distinct,
-        filter,
-        order_by,
-    })))
+    // try udaf first, then built-in aggr fn.
+    if let Ok(fun) = ctx.udaf(function_name) {
+        Ok(Arc::new(Expr::AggregateUDF(expr::AggregateUDF {
+            fun,
+            args,
+            filter,
+            order_by,
+        })))
+    } else if let Ok(fun) = aggregate_function::AggregateFunction::from_str(function_name)
+    {
+        Ok(Arc::new(Expr::AggregateFunction(expr::AggregateFunction {
+            fun,
+            args,
+            distinct,
+            filter,
+            order_by,
+        })))
+    } else {
+        not_impl_err!(
+            "Aggregated function {} is not supported: function anchor = {:?}",
+            function_name,
+            f.function_reference
+        )
+    }
 }
 
 /// Convert Substrait Rex to DataFusion Expr
@@ -860,6 +902,42 @@ pub async fn from_substrait_rex(
                 }
                 ScalarFunctionType::ILike => {
                     make_datafusion_like(true, f, input_schema, extensions).await
+                }
+                ScalarFunctionType::IsNull => {
+                    let arg = f.arguments.first().ok_or_else(|| {
+                        DataFusionError::Substrait(
+                            "expect one argument for `IS NULL` expr".to_string(),
+                        )
+                    })?;
+                    match &arg.arg_type {
+                        Some(ArgType::Value(e)) => {
+                            let expr = from_substrait_rex(e, input_schema, extensions)
+                                .await?
+                                .as_ref()
+                                .clone();
+                            Ok(Arc::new(Expr::IsNull(Box::new(expr))))
+                        }
+                        _ => not_impl_err!("Invalid arguments for IS NULL expression"),
+                    }
+                }
+                ScalarFunctionType::IsNotNull => {
+                    let arg = f.arguments.first().ok_or_else(|| {
+                        DataFusionError::Substrait(
+                            "expect one argument for `IS NOT NULL` expr".to_string(),
+                        )
+                    })?;
+                    match &arg.arg_type {
+                        Some(ArgType::Value(e)) => {
+                            let expr = from_substrait_rex(e, input_schema, extensions)
+                                .await?
+                                .as_ref()
+                                .clone();
+                            Ok(Arc::new(Expr::IsNotNull(Box::new(expr))))
+                        }
+                        _ => {
+                            not_impl_err!("Invalid arguments for IS NOT NULL expression")
+                        }
+                    }
                 }
             }
         }

@@ -17,6 +17,16 @@
 
 //! Defines the unnest column plan for unnesting values in a column that contains a list
 //! type, conceptually is like joining each row with all the values in the list column.
+
+use std::time::Instant;
+use std::{any::Any, sync::Arc};
+
+use super::DisplayAs;
+use crate::{
+    expressions::Column, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+    PhysicalExpr, PhysicalSortExpr, RecordBatchStream, SendableRecordBatchStream,
+};
+
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, LargeListArray, ListArray,
     PrimitiveArray,
@@ -27,23 +37,12 @@ use arrow::datatypes::{
 };
 use arrow::record_batch::RecordBatch;
 use arrow_array::{GenericListArray, OffsetSizeTrait};
-use async_trait::async_trait;
-use datafusion_common::UnnestOptions;
-use datafusion_common::{exec_err, DataFusionError, Result};
+use datafusion_common::{exec_err, DataFusionError, Result, UnnestOptions};
 use datafusion_execution::TaskContext;
-use futures::Stream;
-use futures::StreamExt;
+
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use log::trace;
-use std::time::Instant;
-use std::{any::Any, sync::Arc};
-
-use crate::{
-    expressions::Column, DisplayFormatType, Distribution, EquivalenceProperties,
-    ExecutionPlan, Partitioning, PhysicalExpr, PhysicalSortExpr, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
-};
-
-use super::DisplayAs;
 
 /// Unnest the given column by joining the row with each value in the
 /// nested type.
@@ -136,10 +135,6 @@ impl ExecutionPlan for UnnestExec {
         None
     }
 
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input.equivalence_properties()
-    }
-
     fn execute(
         &self,
         partition: usize,
@@ -158,10 +153,6 @@ impl ExecutionPlan for UnnestExec {
             num_output_rows: 0,
             unnest_time: 0,
         }))
-    }
-
-    fn statistics(&self) -> Statistics {
-        Default::default()
     }
 }
 
@@ -251,7 +242,7 @@ fn build_batch(
     column: &Column,
     options: &UnnestOptions,
 ) -> Result<RecordBatch> {
-    let list_array = column.evaluate(batch)?.into_array(batch.num_rows());
+    let list_array = column.evaluate(batch)?.into_array(batch.num_rows())?;
     match list_array.data_type() {
         DataType::List(_) => {
             let list_array = list_array.as_any().downcast_ref::<ListArray>().unwrap();

@@ -82,7 +82,7 @@ async fn group_by_limit() -> Result<()> {
     let physical_plan = dataframe.create_physical_plan().await?;
     let mut expected_physical_plan = r#"
 GlobalLimitExec: skip=0, fetch=4
-  SortExec: fetch=4, expr=[MAX(traces.ts)@1 DESC]
+  SortExec: TopK(fetch=4), expr=[MAX(traces.ts)@1 DESC]
     AggregateExec: mode=Single, gby=[trace_id@0 as trace_id], aggr=[MAX(traces.ts)], lim=[4]
     "#.trim().to_string();
     let actual_phys_plan =
@@ -149,7 +149,7 @@ async fn create_groupby_context(tmp_dir: &TempDir) -> Result<SessionContext> {
     }
 
     let cfg = SessionConfig::new().with_target_partitions(1);
-    let ctx = SessionContext::with_config(cfg);
+    let ctx = SessionContext::new_with_config(cfg);
     ctx.register_csv(
         "traces",
         tmp_dir.path().to_str().unwrap(),
@@ -231,13 +231,13 @@ async fn group_by_dictionary() {
         .expect("ran plan correctly");
 
         let expected = [
-            "+-------+------------------------+",
-            "| t.val | COUNT(DISTINCT t.dict) |",
-            "+-------+------------------------+",
-            "| 1     | 2                      |",
-            "| 2     | 2                      |",
-            "| 4     | 1                      |",
-            "+-------+------------------------+",
+            "+-----+------------------------+",
+            "| val | COUNT(DISTINCT t.dict) |",
+            "+-----+------------------------+",
+            "| 1   | 2                      |",
+            "| 2   | 2                      |",
+            "| 4   | 1                      |",
+            "+-----+------------------------+",
         ];
         assert_batches_sorted_eq!(expected, &results);
     }

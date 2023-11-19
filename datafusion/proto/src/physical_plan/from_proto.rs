@@ -17,43 +17,44 @@
 
 //! Serde code to convert from protocol buffers to Rust data structures.
 
-use crate::protobuf;
-use arrow::datatypes::DataType;
-use chrono::TimeZone;
-use chrono::Utc;
+use std::convert::{TryFrom, TryInto};
+use std::sync::Arc;
+
+use arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::Schema;
-use datafusion::datasource::listing::{FileRange, PartitionedFile};
+use datafusion::datasource::file_format::json::JsonSink;
+use datafusion::datasource::listing::{FileRange, ListingTableUrl, PartitionedFile};
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::physical_plan::{FileScanConfig, FileSinkConfig};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::window_function::WindowFunction;
 use datafusion::physical_expr::{PhysicalSortExpr, ScalarFunctionExpr};
-use datafusion::physical_plan::expressions::{in_list, LikeExpr};
+use datafusion::physical_plan::expressions::{
+    in_list, BinaryExpr, CaseExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, LikeExpr,
+    Literal, NegativeExpr, NotExpr, TryCastExpr,
+};
 use datafusion::physical_plan::expressions::{GetFieldAccessExpr, GetIndexedFieldExpr};
 use datafusion::physical_plan::windows::create_window_expr;
-use datafusion::physical_plan::WindowExpr;
 use datafusion::physical_plan::{
-    expressions::{
-        BinaryExpr, CaseExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, Literal,
-        NegativeExpr, NotExpr, TryCastExpr,
-    },
-    functions, Partitioning,
+    functions, ColumnStatistics, Partitioning, PhysicalExpr, Statistics, WindowExpr,
 };
-use datafusion::physical_plan::{ColumnStatistics, PhysicalExpr, Statistics};
-use datafusion_common::{not_impl_err, DataFusionError, Result};
-use object_store::path::Path;
-use object_store::ObjectMeta;
-use std::convert::{TryFrom, TryInto};
-use std::ops::Deref;
-use std::sync::Arc;
+use datafusion_common::file_options::json_writer::JsonWriterOptions;
+use datafusion_common::parsers::CompressionTypeVariant;
+use datafusion_common::stats::Precision;
+use datafusion_common::{
+    not_impl_err, DataFusionError, FileTypeWriterOptions, JoinSide, Result, ScalarValue,
+};
 
 use crate::common::proto_error;
 use crate::convert_required;
 use crate::logical_plan;
+use crate::protobuf;
 use crate::protobuf::physical_expr_node::ExprType;
-use datafusion::physical_plan::joins::utils::JoinSide;
-use datafusion::physical_plan::sorts::sort::SortOptions;
+
+use chrono::{TimeZone, Utc};
+use object_store::path::Path;
+use object_store::ObjectMeta;
 
 impl From<&protobuf::PhysicalColumn> for Column {
     fn from(c: &protobuf::PhysicalColumn) -> Column {
@@ -311,12 +312,12 @@ pub fn parse_physical_expr(
                 &e.name,
                 fun_expr,
                 args,
-                &convert_required!(e.return_type)?,
+                convert_required!(e.return_type)?,
                 None,
             ))
         }
         ExprType::ScalarUdf(e) => {
-            let scalar_fun = registry.udf(e.name.as_str())?.deref().clone().fun;
+            let scalar_fun = registry.udf(e.name.as_str())?.fun().clone();
 
             let args = e
                 .args
@@ -328,7 +329,7 @@ pub fn parse_physical_expr(
                 e.name.as_str(),
                 scalar_fun,
                 args,
-                &convert_required!(e.return_type)?,
+                convert_required!(e.return_type)?,
                 None,
             ))
         }
@@ -490,13 +491,8 @@ pub fn parse_protobuf_file_scan_config(
     let table_partition_cols = proto
         .table_partition_cols
         .iter()
-        .map(|col| {
-            Ok((
-                col.to_owned(),
-                schema.field_with_name(col)?.data_type().clone(),
-            ))
-        })
-        .collect::<Result<Vec<(String, DataType)>>>()?;
+        .map(|col| Ok(schema.field_with_name(col)?.clone()))
+        .collect::<Result<Vec<_>>>()?;
 
     let mut output_ordering = vec![];
     for node_collection in &proto.output_ordering {
@@ -544,6 +540,7 @@ impl TryFrom<&protobuf::PartitionedFile> for PartitionedFile {
                 last_modified: Utc.timestamp_nanos(val.last_modified_ns as i64),
                 size: val.size as usize,
                 e_tag: None,
+                version: None,
             },
             partition_values: val
                 .partition_values
@@ -581,10 +578,96 @@ impl TryFrom<&protobuf::FileGroup> for Vec<PartitionedFile> {
 impl From<&protobuf::ColumnStats> for ColumnStatistics {
     fn from(cs: &protobuf::ColumnStats) -> ColumnStatistics {
         ColumnStatistics {
-            null_count: Some(cs.null_count as usize),
-            max_value: cs.max_value.as_ref().map(|m| m.try_into().unwrap()),
-            min_value: cs.min_value.as_ref().map(|m| m.try_into().unwrap()),
-            distinct_count: Some(cs.distinct_count as usize),
+            null_count: if let Some(nc) = &cs.null_count {
+                nc.clone().into()
+            } else {
+                Precision::Absent
+            },
+            max_value: if let Some(max) = &cs.max_value {
+                max.clone().into()
+            } else {
+                Precision::Absent
+            },
+            min_value: if let Some(min) = &cs.min_value {
+                min.clone().into()
+            } else {
+                Precision::Absent
+            },
+            distinct_count: if let Some(dc) = &cs.distinct_count {
+                dc.clone().into()
+            } else {
+                Precision::Absent
+            },
+        }
+    }
+}
+
+impl From<protobuf::Precision> for Precision<usize> {
+    fn from(s: protobuf::Precision) -> Self {
+        let Ok(precision_type) = s.precision_info.try_into() else {
+            return Precision::Absent;
+        };
+        match precision_type {
+            protobuf::PrecisionInfo::Exact => {
+                if let Some(val) = s.val {
+                    if let Ok(ScalarValue::UInt64(Some(val))) =
+                        ScalarValue::try_from(&val)
+                    {
+                        Precision::Exact(val as usize)
+                    } else {
+                        Precision::Absent
+                    }
+                } else {
+                    Precision::Absent
+                }
+            }
+            protobuf::PrecisionInfo::Inexact => {
+                if let Some(val) = s.val {
+                    if let Ok(ScalarValue::UInt64(Some(val))) =
+                        ScalarValue::try_from(&val)
+                    {
+                        Precision::Inexact(val as usize)
+                    } else {
+                        Precision::Absent
+                    }
+                } else {
+                    Precision::Absent
+                }
+            }
+            protobuf::PrecisionInfo::Absent => Precision::Absent,
+        }
+    }
+}
+
+impl From<protobuf::Precision> for Precision<ScalarValue> {
+    fn from(s: protobuf::Precision) -> Self {
+        let Ok(precision_type) = s.precision_info.try_into() else {
+            return Precision::Absent;
+        };
+        match precision_type {
+            protobuf::PrecisionInfo::Exact => {
+                if let Some(val) = s.val {
+                    if let Ok(val) = ScalarValue::try_from(&val) {
+                        Precision::Exact(val)
+                    } else {
+                        Precision::Absent
+                    }
+                } else {
+                    Precision::Absent
+                }
+            }
+            protobuf::PrecisionInfo::Inexact => {
+                if let Some(val) = s.val {
+                    if let Ok(val) = ScalarValue::try_from(&val) {
+                        Precision::Inexact(val)
+                    } else {
+                        Precision::Absent
+                    }
+                } else {
+                    Precision::Absent
+                }
+            }
+            protobuf::PrecisionInfo::Absent => Precision::Absent,
         }
     }
 }
@@ -603,27 +686,91 @@ impl TryFrom<&protobuf::Statistics> for Statistics {
 
     fn try_from(s: &protobuf::Statistics) -> Result<Self, Self::Error> {
         // Keep it sync with Statistics::to_proto
-        let none_value = -1_i64;
-        let column_statistics =
-            s.column_stats.iter().map(|s| s.into()).collect::<Vec<_>>();
         Ok(Statistics {
-            num_rows: if s.num_rows == none_value {
-                None
+            num_rows: if let Some(nr) = &s.num_rows {
+                nr.clone().into()
             } else {
-                Some(s.num_rows as usize)
+                Precision::Absent
             },
-            total_byte_size: if s.total_byte_size == none_value {
-                None
+            total_byte_size: if let Some(tbs) = &s.total_byte_size {
+                tbs.clone().into()
             } else {
-                Some(s.total_byte_size as usize)
+                Precision::Absent
             },
             // No column statistic (None) is encoded with empty array
-            column_statistics: if column_statistics.is_empty() {
-                None
-            } else {
-                Some(column_statistics)
-            },
-            is_exact: s.is_exact,
+            column_statistics: s.column_stats.iter().map(|s| s.into()).collect(),
         })
+    }
+}
+
+impl TryFrom<&protobuf::JsonSink> for JsonSink {
+    type Error = DataFusionError;
+
+    fn try_from(value: &protobuf::JsonSink) -> Result<Self, Self::Error> {
+        Ok(Self::new(convert_required!(value.config)?))
+    }
+}
+
+impl TryFrom<&protobuf::FileSinkConfig> for FileSinkConfig {
+    type Error = DataFusionError;
+
+    fn try_from(conf: &protobuf::FileSinkConfig) -> Result<Self, Self::Error> {
+        let file_groups = conf
+            .file_groups
+            .iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()?;
+        let table_paths = conf
+            .table_paths
+            .iter()
+            .map(ListingTableUrl::parse)
+            .collect::<Result<Vec<_>>>()?;
+        let table_partition_cols = conf
+            .table_partition_cols
+            .iter()
+            .map(|protobuf::PartitionColumn { name, arrow_type }| {
+                let data_type = convert_required!(arrow_type)?;
+                Ok((name.clone(), data_type))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            object_store_url: ObjectStoreUrl::parse(&conf.object_store_url)?,
+            file_groups,
+            table_paths,
+            output_schema: Arc::new(convert_required!(conf.output_schema)?),
+            table_partition_cols,
+            single_file_output: conf.single_file_output,
+            unbounded_input: conf.unbounded_input,
+            overwrite: conf.overwrite,
+            file_type_writer_options: convert_required!(conf.file_type_writer_options)?,
+        })
+    }
+}
+
+impl From<protobuf::CompressionTypeVariant> for CompressionTypeVariant {
+    fn from(value: protobuf::CompressionTypeVariant) -> Self {
+        match value {
+            protobuf::CompressionTypeVariant::Gzip => Self::GZIP,
+            protobuf::CompressionTypeVariant::Bzip2 => Self::BZIP2,
+            protobuf::CompressionTypeVariant::Xz => Self::XZ,
+            protobuf::CompressionTypeVariant::Zstd => Self::ZSTD,
+            protobuf::CompressionTypeVariant::Uncompressed => Self::UNCOMPRESSED,
+        }
+    }
+}
+
+impl TryFrom<&protobuf::FileTypeWriterOptions> for FileTypeWriterOptions {
+    type Error = DataFusionError;
+
+    fn try_from(value: &protobuf::FileTypeWriterOptions) -> Result<Self, Self::Error> {
+        let file_type = value
+            .file_type
+            .as_ref()
+            .ok_or_else(|| proto_error("Missing required field in protobuf"))?;
+        match file_type {
+            protobuf::file_type_writer_options::FileType::JsonOptions(opts) => Ok(
+                Self::JSON(JsonWriterOptions::new(opts.compression().into())),
+            ),
+        }
     }
 }

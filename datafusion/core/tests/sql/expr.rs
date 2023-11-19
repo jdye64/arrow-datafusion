@@ -616,7 +616,7 @@ async fn test_array_cast_expressions() -> Result<()> {
 
 #[tokio::test]
 async fn test_random_expression() -> Result<()> {
-    let ctx = create_ctx();
+    let ctx = SessionContext::new();
     let sql = "SELECT random() r1";
     let actual = execute(&ctx, sql).await;
     let r1 = actual[0][0].parse::<f64>().unwrap();
@@ -627,7 +627,7 @@ async fn test_random_expression() -> Result<()> {
 
 #[tokio::test]
 async fn test_uuid_expression() -> Result<()> {
-    let ctx = create_ctx();
+    let ctx = SessionContext::new();
     let sql = "SELECT uuid()";
     let actual = execute(&ctx, sql).await;
     let uuid = actual[0][0].parse::<uuid::Uuid>().unwrap();
@@ -639,7 +639,7 @@ async fn test_uuid_expression() -> Result<()> {
 async fn test_extract_date_part() -> Result<()> {
     test_expression!("date_part('YEAR', CAST('2000-01-01' AS DATE))", "2000.0");
     test_expression!(
-        "EXTRACT(year FROM to_timestamp('2020-09-08T12:00:00+00:00'))",
+        "EXTRACT(year FROM  timestamp '2020-09-08T12:00:00+00:00')",
         "2020.0"
     );
     test_expression!("date_part('QUARTER', CAST('2000-01-01' AS DATE))", "1.0");
@@ -686,37 +686,56 @@ async fn test_extract_date_part() -> Result<()> {
         "12.0"
     );
     test_expression!(
-        "EXTRACT(second FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "EXTRACT(second FROM timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12.12345678"
     );
     test_expression!(
-        "EXTRACT(millisecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "EXTRACT(millisecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12123.45678"
     );
     test_expression!(
-        "EXTRACT(microsecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "EXTRACT(microsecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12123456.78"
     );
     test_expression!(
-        "EXTRACT(nanosecond FROM to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "EXTRACT(nanosecond FROM timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "1.212345678e10"
     );
     test_expression!(
-        "date_part('second', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "date_part('second', timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12.12345678"
     );
     test_expression!(
-        "date_part('millisecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "date_part('millisecond', timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12123.45678"
     );
     test_expression!(
-        "date_part('microsecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "date_part('microsecond', timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "12123456.78"
     );
     test_expression!(
-        "date_part('nanosecond', to_timestamp('2020-09-08T12:00:12.12345678+00:00'))",
+        "date_part('nanosecond', timestamp '2020-09-08T12:00:12.12345678+00:00')",
         "1.212345678e10"
     );
+
+    // Keep precision when coercing Utf8 to Timestamp
+    test_expression!(
+        "date_part('second', '2020-09-08T12:00:12.12345678+00:00')",
+        "12.12345678"
+    );
+    test_expression!(
+        "date_part('millisecond', '2020-09-08T12:00:12.12345678+00:00')",
+        "12123.45678"
+    );
+    test_expression!(
+        "date_part('microsecond', '2020-09-08T12:00:12.12345678+00:00')",
+        "12123456.78"
+    );
+    test_expression!(
+        "date_part('nanosecond', '2020-09-08T12:00:12.12345678+00:00')",
+        "1.212345678e10"
+    );
+
     Ok(())
 }
 
@@ -883,18 +902,6 @@ async fn csv_query_nullif_divide_by_0() -> Result<()> {
         vec!["203"],
     ];
     assert_eq!(expected, actual);
-    Ok(())
-}
-
-#[tokio::test]
-async fn csv_query_avg_sqrt() -> Result<()> {
-    let ctx = create_ctx();
-    register_aggregate_csv(&ctx).await?;
-    let sql = "SELECT avg(custom_sqrt(c12)) FROM aggregate_test_100";
-    let mut actual = execute(&ctx, sql).await;
-    actual.sort();
-    let expected = vec![vec!["0.6706002946036462"]];
-    assert_float_eq(&expected, &actual);
     Ok(())
 }
 

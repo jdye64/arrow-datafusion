@@ -43,6 +43,7 @@ pub(crate) mod covariance;
 pub(crate) mod first_last;
 pub(crate) mod grouping;
 pub(crate) mod median;
+pub(crate) mod string_agg;
 #[macro_use]
 pub(crate) mod min_max;
 pub mod build_in;
@@ -68,7 +69,7 @@ pub(crate) mod variance;
 /// `PartialEq<dyn Any>` to allows comparing equality between the
 /// trait objects.
 pub trait AggregateExpr: Send + Sync + Debug + PartialEq<dyn Any> {
-    /// Returns the aggregate expression as [`Any`](std::any::Any) so that it can be
+    /// Returns the aggregate expression as [`Any`] so that it can be
     /// downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 

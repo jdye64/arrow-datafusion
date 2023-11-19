@@ -18,6 +18,9 @@
 //! Projection Push Down optimizer rule ensures that only referenced columns are
 //! loaded into memory
 
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
 use crate::eliminate_project::can_eliminate;
 use crate::merge_projection::merge_projection;
 use crate::optimizer::ApplyOrder;
@@ -26,19 +29,13 @@ use crate::{OptimizerConfig, OptimizerRule};
 use arrow::error::Result as ArrowResult;
 use datafusion_common::ScalarValue::UInt8;
 use datafusion_common::{
-    plan_err, Column, DFField, DFSchema, DFSchemaRef, DataFusionError, Result, ToDFSchema,
+    plan_err, Column, DFSchema, DFSchemaRef, DataFusionError, Result,
 };
 use datafusion_expr::expr::{AggregateFunction, Alias};
-use datafusion_expr::utils::exprlist_to_fields;
 use datafusion_expr::{
     logical_plan::{Aggregate, LogicalPlan, Projection, TableScan, Union},
-    utils::{expr_to_columns, exprlist_to_columns},
+    utils::{expr_to_columns, exprlist_to_columns, exprlist_to_fields},
     Expr, LogicalPlanBuilder, SubqueryAlias,
-};
-use std::collections::HashMap;
-use std::{
-    collections::{BTreeSet, HashSet},
-    sync::Arc,
 };
 
 // if projection is empty return projection-new_plan, else return new_plan.
@@ -148,8 +145,6 @@ impl OptimizerRule for PushDownProjection {
             {
                 let mut used_columns: HashSet<Column> = HashSet::new();
                 if projection_is_empty {
-                    used_columns
-                        .insert(scan.projected_schema.fields()[0].qualified_column());
                     push_down_scan(&used_columns, scan, true)?
                 } else {
                     for expr in projection.expr.iter() {
@@ -159,14 +154,6 @@ impl OptimizerRule for PushDownProjection {
 
                     plan.with_new_inputs(&[new_scan])?
                 }
-            }
-            LogicalPlan::Values(values) if projection_is_empty => {
-                let first_col =
-                    Expr::Column(values.schema.fields()[0].qualified_column());
-                LogicalPlan::Projection(Projection::try_new(
-                    vec![first_col],
-                    Arc::new(child_plan.clone()),
-                )?)
             }
             LogicalPlan::Union(union) => {
                 let mut required_columns = HashSet::new();
@@ -423,7 +410,7 @@ pub fn collect_projection_expr(projection: &Projection) -> HashMap<String, Expr>
         .collect::<HashMap<_, _>>()
 }
 
-// Get the projection exprs from columns in the order of the schema
+/// Get the projection exprs from columns in the order of the schema
 fn get_expr(columns: &HashSet<Column>, schema: &DFSchemaRef) -> Result<Vec<Expr>> {
     let expr = schema
         .fields()
@@ -489,23 +476,14 @@ fn push_down_scan(
         .filter_map(ArrowResult::ok)
         .collect();
 
-    if projection.is_empty() {
-        if has_projection && !schema.fields().is_empty() {
-            // Ensure that we are reading at least one column from the table in case the query
-            // does not reference any columns directly such as "SELECT COUNT(1) FROM table",
-            // except when the table is empty (no column)
-            projection.insert(0);
-        } else {
-            // for table scan without projection, we default to return all columns
-            projection = scan
-                .source
-                .schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, _)| i)
-                .collect::<BTreeSet<usize>>();
-        }
+    if !has_projection && projection.is_empty() {
+        // for table scan without projection, we default to return all columns
+        projection = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| i)
+            .collect::<BTreeSet<usize>>();
     }
 
     // Building new projection from BTreeSet
@@ -520,24 +498,14 @@ fn push_down_scan(
         projection.into_iter().collect::<Vec<_>>()
     };
 
-    // create the projected schema
-    let projected_fields: Vec<DFField> = projection
-        .iter()
-        .map(|i| {
-            DFField::from_qualified(scan.table_name.clone(), schema.fields()[*i].clone())
-        })
-        .collect();
-
-    let projected_schema = projected_fields.to_dfschema_ref()?;
-
-    Ok(LogicalPlan::TableScan(TableScan {
-        table_name: scan.table_name.clone(),
-        source: scan.source.clone(),
-        projection: Some(projection),
-        projected_schema,
-        filters: scan.filters.clone(),
-        fetch: scan.fetch,
-    }))
+    TableScan::try_new(
+        scan.table_name.clone(),
+        scan.source.clone(),
+        Some(projection),
+        scan.filters.clone(),
+        scan.fetch,
+    )
+    .map(LogicalPlan::TableScan)
 }
 
 fn restrict_outputs(
@@ -557,25 +525,24 @@ fn restrict_outputs(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::vec;
+
     use super::*;
     use crate::eliminate_project::EliminateProjection;
     use crate::optimizer::Optimizer;
     use crate::test::*;
     use crate::OptimizerContext;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::DFSchema;
+    use datafusion_common::{DFField, DFSchema};
     use datafusion_expr::builder::table_scan_with_filters;
-    use datafusion_expr::expr;
-    use datafusion_expr::expr::Cast;
-    use datafusion_expr::WindowFrame;
-    use datafusion_expr::WindowFunction;
-    use datafusion_expr::{
-        col, count, lit,
-        logical_plan::{builder::LogicalPlanBuilder, table_scan, JoinType},
-        max, min, AggregateFunction, Expr,
+    use datafusion_expr::expr::{self, Cast};
+    use datafusion_expr::logical_plan::{
+        builder::LogicalPlanBuilder, table_scan, JoinType,
     };
-    use std::collections::HashMap;
-    use std::vec;
+    use datafusion_expr::{
+        col, count, lit, max, min, AggregateFunction, Expr, WindowFrame, WindowFunction,
+    };
 
     #[test]
     fn aggregate_no_group_by() -> Result<()> {
@@ -634,6 +601,31 @@ mod tests {
         \n  Projection: test.b\
         \n    Filter: test.c > Int32(1)\
         \n      TableScan: test projection=[b, c]";
+
+        assert_optimized_plan_eq(&plan, expected)
+    }
+
+    #[test]
+    fn aggregate_with_periods() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("tag.one", DataType::Utf8, false)]);
+
+        // Build a plan that looks as follows (note "tag.one" is a column named
+        // "tag.one", not a column named "one" in a table named "tag"):
+        //
+        // Projection: tag.one
+        //   Aggregate: groupBy=[], aggr=[MAX("tag.one") AS "tag.one"]
+        //    TableScan
+        let plan = table_scan(Some("m4"), &schema, None)?
+            .aggregate(
+                Vec::<Expr>::new(),
+                vec![max(col(Column::new_unqualified("tag.one"))).alias("tag.one")],
+            )?
+            .project([col(Column::new_unqualified("tag.one"))])?
+            .build()?;
+
+        let expected = "\
+        Aggregate: groupBy=[[]], aggr=[[MAX(m4.tag.one) AS tag.one]]\
+        \n  TableScan: m4 projection=[tag.one]";
 
         assert_optimized_plan_eq(&plan, expected)
     }
@@ -922,7 +914,7 @@ mod tests {
             .project(vec![lit(1_i64), lit(2_i64)])?
             .build()?;
         let expected = "Projection: Int64(1), Int64(2)\
-                      \n  TableScan: test projection=[a]";
+                      \n  TableScan: test projection=[]";
         assert_optimized_plan_eq(&plan, expected)
     }
 
@@ -969,7 +961,7 @@ mod tests {
 
         let expected = "\
         Projection: Int32(1) AS a\
-        \n  TableScan: test projection=[a]";
+        \n  TableScan: test projection=[]";
 
         assert_optimized_plan_eq(&plan, expected)
     }
@@ -998,7 +990,7 @@ mod tests {
 
         let expected = "\
         Projection: Int32(1) AS a\
-        \n  TableScan: test projection=[a], full_filters=[b = Int32(1)]";
+        \n  TableScan: test projection=[], full_filters=[b = Int32(1)]";
 
         assert_optimized_plan_eq(&plan, expected)
     }

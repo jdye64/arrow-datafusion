@@ -44,6 +44,7 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::{AggregateFunction, WindowFrame, WindowFunction};
 use datafusion_physical_expr::expressions::col;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_plan::windows::PartitionSearchMode;
 
 use async_trait::async_trait;
 
@@ -140,14 +141,13 @@ impl QueryCase {
     async fn run_case(&self, ctx: SessionContext, error: Option<&String>) -> Result<()> {
         let dataframe = ctx.sql(self.sql.as_str()).await?;
         let plan = dataframe.create_physical_plan().await;
-        if error.is_some() {
+        if let Some(error) = error {
             let plan_error = plan.unwrap_err();
-            let initial = error.unwrap().to_string();
             assert!(
-                plan_error.to_string().contains(initial.as_str()),
+                plan_error.to_string().contains(error.as_str()),
                 "plan_error: {:?} doesn't contain message: {:?}",
                 plan_error,
-                initial.as_str()
+                error.as_str()
             );
         } else {
             assert!(plan.is_ok())
@@ -239,9 +239,8 @@ pub fn bounded_window_exec(
             )
             .unwrap()],
             input.clone(),
-            input.schema(),
             vec![],
-            crate::physical_plan::windows::PartitionSearchMode::Sorted,
+            PartitionSearchMode::Sorted,
         )
         .unwrap(),
     )
@@ -269,7 +268,7 @@ pub fn parquet_exec(schema: &SchemaRef) -> Arc<ParquetExec> {
             object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
             file_schema: schema.clone(),
             file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
-            statistics: Statistics::default(),
+            statistics: Statistics::new_unknown(schema),
             projection: None,
             limit: None,
             table_partition_cols: vec![],
@@ -293,7 +292,7 @@ pub fn parquet_exec_sorted(
             object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
             file_schema: schema.clone(),
             file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
-            statistics: Statistics::default(),
+            statistics: Statistics::new_unknown(schema),
             projection: None,
             limit: None,
             table_partition_cols: vec![],
@@ -323,6 +322,14 @@ pub fn global_limit_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan
 
 pub fn repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(10)).unwrap())
+}
+
+pub fn spr_repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    Arc::new(
+        RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(10))
+            .unwrap()
+            .with_preserve_order(),
+    )
 }
 
 pub fn aggregate_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {

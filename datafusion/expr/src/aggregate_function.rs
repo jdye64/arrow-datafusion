@@ -20,7 +20,7 @@
 use crate::utils;
 use crate::{type_coercion::aggregates::*, Signature, TypeSignature, Volatility};
 use arrow::datatypes::{DataType, Field};
-use datafusion_common::{plan_err, DataFusionError, Result};
+use datafusion_common::{plan_datafusion_err, plan_err, DataFusionError, Result};
 use std::sync::Arc;
 use std::{fmt, str::FromStr};
 use strum_macros::EnumIter;
@@ -100,6 +100,8 @@ pub enum AggregateFunction {
     BoolAnd,
     /// Bool Or
     BoolOr,
+    /// string_agg
+    StringAgg,
 }
 
 impl AggregateFunction {
@@ -116,13 +118,13 @@ impl AggregateFunction {
             ArrayAgg => "ARRAY_AGG",
             FirstValue => "FIRST_VALUE",
             LastValue => "LAST_VALUE",
-            Variance => "VARIANCE",
-            VariancePop => "VARIANCE_POP",
+            Variance => "VAR",
+            VariancePop => "VAR_POP",
             Stddev => "STDDEV",
             StddevPop => "STDDEV_POP",
-            Covariance => "COVARIANCE",
-            CovariancePop => "COVARIANCE_POP",
-            Correlation => "CORRELATION",
+            Covariance => "COVAR",
+            CovariancePop => "COVAR_POP",
+            Correlation => "CORR",
             RegrSlope => "REGR_SLOPE",
             RegrIntercept => "REGR_INTERCEPT",
             RegrCount => "REGR_COUNT",
@@ -141,6 +143,7 @@ impl AggregateFunction {
             BitXor => "BIT_XOR",
             BoolAnd => "BOOL_AND",
             BoolOr => "BOOL_OR",
+            StringAgg => "STRING_AGG",
         }
     }
 }
@@ -171,6 +174,7 @@ impl FromStr for AggregateFunction {
             "array_agg" => AggregateFunction::ArrayAgg,
             "first_value" => AggregateFunction::FirstValue,
             "last_value" => AggregateFunction::LastValue,
+            "string_agg" => AggregateFunction::StringAgg,
             // statistical
             "corr" => AggregateFunction::Correlation,
             "covar" => AggregateFunction::Covariance,
@@ -232,11 +236,14 @@ impl AggregateFunction {
             // original errors are all related to wrong function signature
             // aggregate them for better error message
             .map_err(|_| {
-                DataFusionError::Plan(utils::generate_signature_error_msg(
-                    &format!("{self}"),
-                    self.signature(),
-                    input_expr_types,
-                ))
+                plan_datafusion_err!(
+                    "{}",
+                    utils::generate_signature_error_msg(
+                        &format!("{self}"),
+                        self.signature(),
+                        input_expr_types,
+                    )
+                )
             })?;
 
         match self {
@@ -296,6 +303,7 @@ impl AggregateFunction {
             AggregateFunction::FirstValue | AggregateFunction::LastValue => {
                 Ok(coerced_data_types[0].clone())
             }
+            AggregateFunction::StringAgg => Ok(DataType::LargeUtf8),
         }
     }
 }
@@ -405,6 +413,30 @@ impl AggregateFunction {
                     .collect(),
                 Volatility::Immutable,
             ),
+            AggregateFunction::StringAgg => {
+                Signature::uniform(2, STRINGS.to_vec(), Volatility::Immutable)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use strum::IntoEnumIterator;
+
+    #[test]
+    // Test for AggregateFuncion's Display and from_str() implementations.
+    // For each variant in AggregateFuncion, it converts the variant to a string
+    // and then back to a variant. The test asserts that the original variant and
+    // the reconstructed variant are the same. This assertion is also necessary for
+    // function suggestion. See https://github.com/apache/arrow-datafusion/issues/8082
+    fn test_display_and_from_str() {
+        for func_original in AggregateFunction::iter() {
+            let func_name = func_original.to_string();
+            let func_from_str =
+                AggregateFunction::from_str(func_name.to_lowercase().as_str()).unwrap();
+            assert_eq!(func_from_str, func_original);
         }
     }
 }

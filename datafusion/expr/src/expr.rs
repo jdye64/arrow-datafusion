@@ -17,7 +17,6 @@
 
 //! Expr module contains core type definition for `Expr`.
 
-use crate::aggregate_function;
 use crate::built_in_function;
 use crate::expr_fn::binary_expr;
 use crate::logical_plan::Subquery;
@@ -26,8 +25,10 @@ use crate::utils::{expr_to_columns, find_out_reference_exprs};
 use crate::window_frame;
 use crate::window_function;
 use crate::Operator;
+use crate::{aggregate_function, ExprSchemable};
 use arrow::datatypes::DataType;
-use datafusion_common::internal_err;
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{internal_err, DFSchema, OwnedTableReference};
 use datafusion_common::{plan_err, Column, DataFusionError, Result, ScalarValue};
 use std::collections::HashSet;
 use std::fmt;
@@ -39,7 +40,7 @@ use std::sync::Arc;
 /// represent logical expressions such as `A + 1`, or `CAST(c1 AS
 /// int)`.
 ///
-/// An `Expr` can compute its [DataType](arrow::datatypes::DataType)
+/// An `Expr` can compute its [DataType]
 /// and nullability, and has functions for building up complex
 /// expressions.
 ///
@@ -98,21 +99,21 @@ pub enum Expr {
     SimilarTo(Like),
     /// Negation of an expression. The expression's type must be a boolean to make sense.
     Not(Box<Expr>),
-    /// Whether an expression is not Null. This expression is never null.
+    /// True if argument is not NULL, false otherwise. This expression itself is never NULL.
     IsNotNull(Box<Expr>),
-    /// Whether an expression is Null. This expression is never null.
+    /// True if argument is NULL, false otherwise. This expression itself is never NULL.
     IsNull(Box<Expr>),
-    /// Whether an expression is True. Boolean operation
+    /// True if argument is true, false otherwise. This expression itself is never NULL.
     IsTrue(Box<Expr>),
-    /// Whether an expression is False. Boolean operation
+    /// True if argument is  false, false otherwise. This expression itself is never NULL.
     IsFalse(Box<Expr>),
-    /// Whether an expression is Unknown. Boolean operation
+    /// True if argument is NULL, false otherwise. This expression itself is never NULL.
     IsUnknown(Box<Expr>),
-    /// Whether an expression is not True. Boolean operation
+    /// True if argument is FALSE or NULL, false otherwise. This expression itself is never NULL.
     IsNotTrue(Box<Expr>),
-    /// Whether an expression is not False. Boolean operation
+    /// True if argument is TRUE OR NULL, false otherwise. This expression itself is never NULL.
     IsNotFalse(Box<Expr>),
-    /// Whether an expression is not Unknown. Boolean operation
+    /// True if argument is TRUE or FALSE, false otherwise. This expression itself is never NULL.
     IsNotUnknown(Box<Expr>),
     /// arithmetic negation of an expression, the operand must be of a signed numeric data type
     Negative(Box<Expr>),
@@ -165,10 +166,12 @@ pub enum Expr {
     InSubquery(InSubquery),
     /// Scalar subquery
     ScalarSubquery(Subquery),
-    /// Represents a reference to all fields in a schema.
-    Wildcard,
-    /// Represents a reference to all fields in a specific schema.
-    QualifiedWildcard { qualifier: String },
+    /// Represents a reference to all available fields in a specific schema,
+    /// with an optional (schema) qualifier.
+    ///
+    /// This expr has to be resolved to a list of columns before translating logical
+    /// plan into physical plan.
+    Wildcard { qualifier: Option<String> },
     /// List of grouping set expressions. Only valid in the context of an aggregate
     /// GROUP BY expression list
     GroupingSet(GroupingSet),
@@ -184,13 +187,20 @@ pub enum Expr {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Alias {
     pub expr: Box<Expr>,
+    pub relation: Option<OwnedTableReference>,
     pub name: String,
 }
 
 impl Alias {
-    pub fn new(expr: Expr, name: impl Into<String>) -> Self {
+    /// Create an alias with an optional schema/field qualifier.
+    pub fn new(
+        expr: Expr,
+        relation: Option<impl Into<OwnedTableReference>>,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             expr: Box::new(expr),
+            relation: relation.map(|r| r.into()),
             name: name.into(),
         }
     }
@@ -328,7 +338,7 @@ impl Between {
     }
 }
 
-/// ScalarFunction expression
+/// ScalarFunction expression invokes a built-in scalar function
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ScalarFunction {
     /// The function
@@ -344,7 +354,9 @@ impl ScalarFunction {
     }
 }
 
-/// ScalarUDF expression
+/// ScalarUDF expression invokes a user-defined scalar function [`ScalarUDF`]
+///
+/// [`ScalarUDF`]: crate::ScalarUDF
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ScalarUDF {
     /// The function
@@ -599,10 +611,13 @@ impl InSubquery {
     }
 }
 
-/// Placeholder
+/// Placeholder, representing bind parameter values such as `$1`.
+///
+/// The type of these parameters is inferred using [`Expr::infer_placeholder_types`]
+/// or can be specified directly using `PREPARE` statements.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Placeholder {
-    /// The identifier of the parameter (e.g, $1 or $foo)
+    /// The identifier of the parameter, including the leading `$` (e.g, `"$1"` or `"$foo"`)
     pub id: String,
     /// The type the parameter will be filled in with
     pub data_type: Option<DataType>,
@@ -719,7 +734,6 @@ impl Expr {
             Expr::Negative(..) => "Negative",
             Expr::Not(..) => "Not",
             Expr::Placeholder(_) => "Placeholder",
-            Expr::QualifiedWildcard { .. } => "QualifiedWildcard",
             Expr::ScalarFunction(..) => "ScalarFunction",
             Expr::ScalarSubquery { .. } => "ScalarSubquery",
             Expr::ScalarUDF(..) => "ScalarUDF",
@@ -727,7 +741,7 @@ impl Expr {
             Expr::Sort { .. } => "Sort",
             Expr::TryCast { .. } => "TryCast",
             Expr::WindowFunction { .. } => "WindowFunction",
-            Expr::Wildcard => "Wildcard",
+            Expr::Wildcard { .. } => "Wildcard",
         }
     }
 
@@ -839,7 +853,27 @@ impl Expr {
                 asc,
                 nulls_first,
             }) => Expr::Sort(Sort::new(Box::new(expr.alias(name)), asc, nulls_first)),
-            _ => Expr::Alias(Alias::new(self, name.into())),
+            _ => Expr::Alias(Alias::new(self, None::<&str>, name.into())),
+        }
+    }
+
+    /// Return `self AS name` alias expression with a specific qualifier
+    pub fn alias_qualified(
+        self,
+        relation: Option<impl Into<OwnedTableReference>>,
+        name: impl Into<String>,
+    ) -> Expr {
+        match self {
+            Expr::Sort(Sort {
+                expr,
+                asc,
+                nulls_first,
+            }) => Expr::Sort(Sort::new(
+                Box::new(expr.alias_qualified(relation, name)),
+                asc,
+                nulls_first,
+            )),
+            _ => Expr::Alias(Alias::new(self, relation, name.into())),
         }
     }
 
@@ -1030,6 +1064,52 @@ impl Expr {
     pub fn contains_outer(&self) -> bool {
         !find_out_reference_exprs(self).is_empty()
     }
+
+    /// Recursively find all [`Expr::Placeholder`] expressions, and
+    /// to infer their [`DataType`] from the context of their use.
+    ///
+    /// For example, gicen an expression like `<int32> = $0` will infer `$0` to
+    /// have type `int32`.
+    pub fn infer_placeholder_types(self, schema: &DFSchema) -> Result<Expr> {
+        self.transform(&|mut expr| {
+            // Default to assuming the arguments are the same type
+            if let Expr::BinaryExpr(BinaryExpr { left, op: _, right }) = &mut expr {
+                rewrite_placeholder(left.as_mut(), right.as_ref(), schema)?;
+                rewrite_placeholder(right.as_mut(), left.as_ref(), schema)?;
+            };
+            if let Expr::Between(Between {
+                expr,
+                negated: _,
+                low,
+                high,
+            }) = &mut expr
+            {
+                rewrite_placeholder(low.as_mut(), expr.as_ref(), schema)?;
+                rewrite_placeholder(high.as_mut(), expr.as_ref(), schema)?;
+            }
+            Ok(Transformed::Yes(expr))
+        })
+    }
+}
+
+// modifies expr if it is a placeholder with datatype of right
+fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
+    if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
+        if data_type.is_none() {
+            let other_dt = other.get_type(schema);
+            match other_dt {
+                Err(e) => {
+                    Err(e.context(format!(
+                        "Can not find type of {other} needed to infer type of {expr}"
+                    )))?;
+                }
+                Ok(dt) => {
+                    *data_type = Some(dt);
+                }
+            }
+        };
+    }
+    Ok(())
 }
 
 #[macro_export]
@@ -1122,7 +1202,7 @@ impl fmt::Display for Expr {
                 fmt_function(f, &func.fun.to_string(), false, &func.args, true)
             }
             Expr::ScalarUDF(ScalarUDF { fun, args }) => {
-                fmt_function(f, &fun.name, false, args, true)
+                fmt_function(f, fun.name(), false, args, true)
             }
             Expr::WindowFunction(WindowFunction {
                 fun,
@@ -1169,7 +1249,7 @@ impl fmt::Display for Expr {
                 order_by,
                 ..
             }) => {
-                fmt_function(f, &fun.name, false, args, true)?;
+                fmt_function(f, fun.name(), false, args, true)?;
                 if let Some(fe) = filter {
                     write!(f, " FILTER (WHERE {fe})")?;
                 }
@@ -1236,8 +1316,10 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IN ([{}])", expr_vec_fmt!(list))
                 }
             }
-            Expr::Wildcard => write!(f, "*"),
-            Expr::QualifiedWildcard { qualifier } => write!(f, "{qualifier}.*"),
+            Expr::Wildcard { qualifier } => match qualifier {
+                Some(qualifier) => write!(f, "{qualifier}.*"),
+                None => write!(f, "*"),
+            },
             Expr::GetIndexedField(GetIndexedField { field, expr }) => match field {
                 GetFieldAccess::NamedStructField { name } => {
                     write!(f, "({expr})[{name}]")
@@ -1456,7 +1538,7 @@ fn create_name(e: &Expr) -> Result<String> {
             create_function_name(&func.fun.to_string(), false, &func.args)
         }
         Expr::ScalarUDF(ScalarUDF { fun, args }) => {
-            create_function_name(&fun.name, false, args)
+            create_function_name(fun.name(), false, args)
         }
         Expr::WindowFunction(WindowFunction {
             fun,
@@ -1509,7 +1591,7 @@ fn create_name(e: &Expr) -> Result<String> {
             if let Some(ob) = order_by {
                 info += &format!(" ORDER BY ([{}])", expr_vec_fmt!(ob));
             }
-            Ok(format!("{}({}){}", fun.name, names.join(","), info))
+            Ok(format!("{}({}){}", fun.name(), names.join(","), info))
         }
         Expr::GroupingSet(grouping_set) => match grouping_set {
             GroupingSet::Rollup(exprs) => {
@@ -1557,10 +1639,12 @@ fn create_name(e: &Expr) -> Result<String> {
         Expr::Sort { .. } => {
             internal_err!("Create name does not support sort expression")
         }
-        Expr::Wildcard => Ok("*".to_string()),
-        Expr::QualifiedWildcard { .. } => {
-            internal_err!("Create name does not support qualified wildcard")
-        }
+        Expr::Wildcard { qualifier } => match qualifier {
+            Some(qualifier) => internal_err!(
+                "Create name does not support qualified wildcard, got {qualifier}"
+            ),
+            None => Ok("*".to_string()),
+        },
         Expr::Placeholder(Placeholder { id, .. }) => Ok((*id).to_string()),
     }
 }
@@ -1645,5 +1729,41 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_logical_ops() {
+        assert_eq!(
+            format!("{}", lit(1u32).eq(lit(2u32))),
+            "UInt32(1) = UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).not_eq(lit(2u32))),
+            "UInt32(1) != UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).gt(lit(2u32))),
+            "UInt32(1) > UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).gt_eq(lit(2u32))),
+            "UInt32(1) >= UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).lt(lit(2u32))),
+            "UInt32(1) < UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).lt_eq(lit(2u32))),
+            "UInt32(1) <= UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).and(lit(2u32))),
+            "UInt32(1) AND UInt32(2)"
+        );
+        assert_eq!(
+            format!("{}", lit(1u32).or(lit(2u32))),
+            "UInt32(1) OR UInt32(2)"
+        );
     }
 }

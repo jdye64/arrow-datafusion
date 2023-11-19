@@ -23,25 +23,21 @@ use std::fmt;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::csv::WriterBuilder;
-use arrow::datatypes::{DataType, Field, Fields, Schema};
-use arrow::{self, datatypes::SchemaRef};
 use arrow_array::RecordBatch;
 use datafusion_common::{exec_err, not_impl_err, DataFusionError, FileType};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalSortRequirement};
 
-use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use datafusion_physical_plan::metrics::MetricsSet;
 use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
 
+use super::write::orchestration::stateless_multipart_put;
 use super::{FileFormat, DEFAULT_SCHEMA_INFER_MAX_RECORD};
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
-use crate::datasource::file_format::write::{
-    create_writer, stateless_serialize_and_write_files, BatchSerializer, FileWriterMode,
-};
+use crate::datasource::file_format::write::BatchSerializer;
 use crate::datasource::physical_plan::{
     CsvExec, FileGroupDisplay, FileScanConfig, FileSinkConfig,
 };
@@ -50,7 +46,12 @@ use crate::execution::context::SessionState;
 use crate::physical_plan::insert::{DataSink, FileSinkExec};
 use crate::physical_plan::{DisplayAs, DisplayFormatType, Statistics};
 use crate::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
-use rand::distributions::{Alphanumeric, DistString};
+
+use arrow::csv::WriterBuilder;
+use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::{self, datatypes::SchemaRef};
+
+use async_trait::async_trait;
 
 /// Character Separated Value `FileFormat` implementation.
 #[derive(Debug)]
@@ -235,10 +236,10 @@ impl FileFormat for CsvFormat {
         &self,
         _state: &SessionState,
         _store: &Arc<dyn ObjectStore>,
-        _table_schema: SchemaRef,
+        table_schema: SchemaRef,
         _object: &ObjectMeta,
     ) -> Result<Statistics> {
-        Ok(Statistics::default())
+        Ok(Statistics::new_unknown(&table_schema))
     }
 
     async fn create_physical_plan(
@@ -263,6 +264,7 @@ impl FileFormat for CsvFormat {
         input: Arc<dyn ExecutionPlan>,
         _state: &SessionState,
         conf: FileSinkConfig,
+        order_requirements: Option<Vec<PhysicalSortRequirement>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if conf.overwrite {
             return not_impl_err!("Overwrites are not implemented yet for CSV");
@@ -275,7 +277,12 @@ impl FileFormat for CsvFormat {
         let sink_schema = conf.output_schema().clone();
         let sink = Arc::new(CsvSink::new(conf));
 
-        Ok(Arc::new(FileSinkExec::new(input, sink, sink_schema)) as _)
+        Ok(Arc::new(FileSinkExec::new(
+            input,
+            sink,
+            sink_schema,
+            order_requirements,
+        )) as _)
     }
 
     fn file_type(&self) -> FileType {
@@ -426,7 +433,7 @@ impl CsvSerializer {
 impl BatchSerializer for CsvSerializer {
     async fn serialize(&mut self, batch: RecordBatch) -> Result<Bytes> {
         let builder = self.builder.clone();
-        let mut writer = builder.has_headers(self.header).build(&mut self.buffer);
+        let mut writer = builder.with_header(self.header).build(&mut self.buffer);
         writer.write(&batch)?;
         drop(writer);
         self.header = false;
@@ -458,11 +465,7 @@ impl DisplayAs for CsvSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "CsvSink(writer_mode={:?}, file_groups=",
-                    self.config.writer_mode
-                )?;
+                write!(f, "CsvSink(file_groups=",)?;
                 FileGroupDisplay(&self.config.file_groups).fmt_as(t, f)?;
                 write!(f, ")")
             }
@@ -474,122 +477,55 @@ impl CsvSink {
     fn new(config: FileSinkConfig) -> Self {
         Self { config }
     }
+    async fn multipartput_all(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let writer_options = self.config.file_type_writer_options.try_into_csv()?;
+        let builder = &writer_options.writer_options;
+
+        let builder_clone = builder.clone();
+        let options_clone = writer_options.clone();
+        let get_serializer = move || {
+            let inner_clone = builder_clone.clone();
+            let serializer: Box<dyn BatchSerializer> = Box::new(
+                CsvSerializer::new()
+                    .with_builder(inner_clone)
+                    .with_header(options_clone.writer_options.header()),
+            );
+            serializer
+        };
+
+        stateless_multipart_put(
+            data,
+            context,
+            "csv".into(),
+            Box::new(get_serializer),
+            &self.config,
+            writer_options.compression.into(),
+        )
+        .await
+    }
 }
 
 #[async_trait]
 impl DataSink for CsvSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
     async fn write_all(
         &self,
-        data: Vec<SendableRecordBatchStream>,
+        data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let num_partitions = data.len();
-        let writer_options = self.config.file_type_writer_options.try_into_csv()?;
-        let (builder, compression) =
-            (&writer_options.writer_options, &writer_options.compression);
-        let mut has_header = writer_options.has_header;
-        let compression = FileCompressionType::from(*compression);
-
-        let object_store = context
-            .runtime_env()
-            .object_store(&self.config.object_store_url)?;
-        // Construct serializer and writer for each file group
-        let mut serializers: Vec<Box<dyn BatchSerializer>> = vec![];
-        let mut writers = vec![];
-        match self.config.writer_mode {
-            FileWriterMode::Append => {
-                for file_group in &self.config.file_groups {
-                    let mut append_builder = builder.clone();
-                    // In append mode, consider has_header flag only when file is empty (at the start).
-                    // For other modes, use has_header flag as is.
-                    if file_group.object_meta.size != 0 {
-                        has_header = false;
-                        append_builder = append_builder.has_headers(false);
-                    }
-                    let serializer = CsvSerializer::new()
-                        .with_builder(append_builder)
-                        .with_header(has_header);
-                    serializers.push(Box::new(serializer));
-
-                    let file = file_group.clone();
-                    let writer = create_writer(
-                        self.config.writer_mode,
-                        compression,
-                        file.object_meta.clone().into(),
-                        object_store.clone(),
-                    )
-                    .await?;
-                    writers.push(writer);
-                }
-            }
-            FileWriterMode::Put => {
-                return not_impl_err!("Put Mode is not implemented for CSV Sink yet")
-            }
-            FileWriterMode::PutMultipart => {
-                // Currently assuming only 1 partition path (i.e. not hive-style partitioning on a column)
-                let base_path = &self.config.table_paths[0];
-                match self.config.single_file_output {
-                    false => {
-                        // Uniquely identify this batch of files with a random string, to prevent collisions overwriting files
-                        let write_id =
-                            Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-                        for part_idx in 0..num_partitions {
-                            let serializer = CsvSerializer::new()
-                                .with_builder(builder.clone())
-                                .with_header(has_header);
-                            serializers.push(Box::new(serializer));
-                            let file_path = base_path
-                                .prefix()
-                                .child(format!("{}_{}.csv", write_id, part_idx));
-                            let object_meta = ObjectMeta {
-                                location: file_path,
-                                last_modified: chrono::offset::Utc::now(),
-                                size: 0,
-                                e_tag: None,
-                            };
-                            let writer = create_writer(
-                                self.config.writer_mode,
-                                compression,
-                                object_meta.into(),
-                                object_store.clone(),
-                            )
-                            .await?;
-                            writers.push(writer);
-                        }
-                    }
-                    true => {
-                        let serializer = CsvSerializer::new()
-                            .with_builder(builder.clone())
-                            .with_header(has_header);
-                        serializers.push(Box::new(serializer));
-                        let file_path = base_path.prefix();
-                        let object_meta = ObjectMeta {
-                            location: file_path.clone(),
-                            last_modified: chrono::offset::Utc::now(),
-                            size: 0,
-                            e_tag: None,
-                        };
-                        let writer = create_writer(
-                            self.config.writer_mode,
-                            compression,
-                            object_meta.into(),
-                            object_store.clone(),
-                        )
-                        .await?;
-                        writers.push(writer);
-                    }
-                }
-            }
-        }
-
-        stateless_serialize_and_write_files(
-            data,
-            serializers,
-            writers,
-            self.config.single_file_output,
-            self.config.unbounded_input,
-        )
-        .await
+        let total_count = self.multipartput_all(data, context).await?;
+        Ok(total_count)
     }
 }
 
@@ -610,6 +546,7 @@ mod tests {
     use chrono::DateTime;
     use datafusion_common::cast::as_string_array;
     use datafusion_common::internal_err;
+    use datafusion_common::stats::Precision;
     use datafusion_common::FileType;
     use datafusion_common::GetExt;
     use datafusion_expr::{col, lit};
@@ -622,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn read_small_batches() -> Result<()> {
         let config = SessionConfig::new().with_batch_size(2);
-        let session_ctx = SessionContext::with_config(config);
+        let session_ctx = SessionContext::new_with_config(config);
         let state = session_ctx.state();
         let task_ctx = state.task_ctx();
         // skip column 9 that overflows the automaticly discovered column type of i64 (u64 would work)
@@ -642,8 +579,8 @@ mod tests {
         assert_eq!(tt_batches, 50 /* 100/2 */);
 
         // test metadata
-        assert_eq!(exec.statistics().num_rows, None);
-        assert_eq!(exec.statistics().total_byte_size, None);
+        assert_eq!(exec.statistics()?.num_rows, Precision::Absent);
+        assert_eq!(exec.statistics()?.total_byte_size, Precision::Absent);
 
         Ok(())
     }
@@ -736,6 +673,7 @@ mod tests {
             last_modified: DateTime::default(),
             size: usize::MAX,
             e_tag: None,
+            version: None,
         };
 
         let num_rows_to_read = 100;
@@ -960,7 +898,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let testdata = arrow_test_data();
         ctx.register_csv(
             "aggr",
@@ -997,7 +935,7 @@ mod tests {
             .has_header(true)
             .file_compression_type(FileCompressionType::GZIP)
             .file_extension("csv.gz");
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let testdata = arrow_test_data();
         ctx.register_csv(
             "aggr",
@@ -1033,7 +971,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         ctx.register_csv(
             "empty",
             "tests/data/empty_0_byte.csv",
@@ -1066,7 +1004,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         ctx.register_csv(
             "empty",
             "tests/data/empty.csv",
@@ -1104,7 +1042,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let file_format = CsvFormat::default().with_has_header(false);
         let listing_options = ListingOptions::new(Arc::new(file_format))
             .with_file_extension(FileType::CSV.get_ext());
@@ -1157,7 +1095,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let file_format = CsvFormat::default().with_has_header(false);
         let listing_options = ListingOptions::new(Arc::new(file_format))
             .with_file_extension(FileType::CSV.get_ext());
@@ -1202,7 +1140,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
 
         ctx.register_csv(
             "one_col",
@@ -1251,7 +1189,7 @@ mod tests {
             .with_repartition_file_scans(true)
             .with_repartition_file_min_size(0)
             .with_target_partitions(n_partitions);
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         ctx.register_csv(
             "wide_rows",
             "tests/data/wide_rows.csv",

@@ -17,20 +17,26 @@
 
 //! Coercion rules for matching argument types for binary operators
 
+use std::sync::Arc;
+
+use crate::Operator;
+
 use arrow::array::{new_empty_array, Array};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{
-    DataType, TimeUnit, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE,
+    DataType, Field, TimeUnit, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE,
     DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
 };
 
-use datafusion_common::Result;
-use datafusion_common::{plan_err, DataFusionError};
+use datafusion_common::{
+    exec_datafusion_err, plan_datafusion_err, plan_err, DataFusionError, Result,
+};
 
-use crate::type_coercion::is_numeric;
-use crate::Operator;
-
-/// The type signature of an instantiation of binary expression
+/// The type signature of an instantiation of binary operator expression such as
+/// `lhs + rhs`
+///
+/// Note this is different than [`crate::signature::Signature`] which
+/// describes the type signature of a function.
 struct Signature {
     /// The type to coerce the left argument to
     lhs: DataType,
@@ -62,83 +68,75 @@ impl Signature {
 
 /// Returns a [`Signature`] for applying `op` to arguments of type `lhs` and `rhs`
 fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature> {
+    use arrow::datatypes::DataType::*;
+    use Operator::*;
     match op {
-        Operator::Eq |
-        Operator::NotEq |
-        Operator::Lt |
-        Operator::LtEq |
-        Operator::Gt |
-        Operator::GtEq |
-        Operator::IsDistinctFrom |
-        Operator::IsNotDistinctFrom => {
+        Eq |
+        NotEq |
+        Lt |
+        LtEq |
+        Gt |
+        GtEq |
+        IsDistinctFrom |
+        IsNotDistinctFrom => {
             comparison_coercion(lhs, rhs).map(Signature::comparison).ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Cannot infer common argument type for comparison operation {lhs} {op} {rhs}"
-                ))
+                )
             })
         }
-        Operator::And | Operator::Or => match (lhs, rhs) {
-            // logical binary boolean operators can only be evaluated in bools or nulls
-            (DataType::Boolean, DataType::Boolean)
-            | (DataType::Null, DataType::Null)
-            | (DataType::Boolean, DataType::Null)
-            | (DataType::Null, DataType::Boolean) => Ok(Signature::uniform(DataType::Boolean)),
-            _ => plan_err!(
+        And | Or => if matches!((lhs, rhs), (Boolean | Null, Boolean | Null)) {
+            // Logical binary boolean operators can only be evaluated for
+            // boolean or null arguments.                   
+            Ok(Signature::uniform(DataType::Boolean))
+        } else {
+            plan_err!(
                 "Cannot infer common argument type for logical boolean operation {lhs} {op} {rhs}"
-            ),
-        },
-        Operator::RegexMatch |
-        Operator::RegexIMatch |
-        Operator::RegexNotMatch |
-        Operator::RegexNotIMatch => {
+            )
+        }
+        RegexMatch | RegexIMatch | RegexNotMatch | RegexNotIMatch => {
             regex_coercion(lhs, rhs).map(Signature::comparison).ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Cannot infer common argument type for regex operation {lhs} {op} {rhs}"
-                ))
+                )
             })
         }
-        Operator::BitwiseAnd
-        | Operator::BitwiseOr
-        | Operator::BitwiseXor
-        | Operator::BitwiseShiftRight
-        | Operator::BitwiseShiftLeft => {
+        BitwiseAnd | BitwiseOr | BitwiseXor | BitwiseShiftRight | BitwiseShiftLeft => {
             bitwise_coercion(lhs, rhs).map(Signature::uniform).ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Cannot infer common type for bitwise operation {lhs} {op} {rhs}"
-                ))
+                )
             })
         }
-        Operator::StringConcat => {
+        StringConcat => {
             string_concat_coercion(lhs, rhs).map(Signature::uniform).ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Cannot infer common string type for string concat operation {lhs} {op} {rhs}"
-                ))
+                )
             })
         }
-        Operator::AtArrow
-        | Operator::ArrowAt => {
-            array_coercion(lhs, rhs).map(Signature::uniform).ok_or_else(|| {
-                DataFusionError::Plan(format!(
+        AtArrow | ArrowAt => {
+            // ArrowAt and AtArrow check for whether one array ic contained in another.
+            // The result type is boolean. Signature::comparison defines this signature.
+            // Operation has nothing to do with comparison
+            array_coercion(lhs, rhs).map(Signature::comparison).ok_or_else(|| {
+                plan_datafusion_err!(
                     "Cannot infer common array type for arrow operation {lhs} {op} {rhs}"
-                ))
+                )
             })
         }
-        Operator::Plus |
-        Operator::Minus |
-        Operator::Multiply |
-        Operator::Divide|
-        Operator::Modulo =>  {
+        Plus | Minus | Multiply | Divide | Modulo =>  {
             let get_result = |lhs, rhs| {
                 use arrow::compute::kernels::numeric::*;
                 let l = new_empty_array(lhs);
                 let r = new_empty_array(rhs);
 
                 let result = match op {
-                    Operator::Plus => add_wrapping(&l, &r),
-                    Operator::Minus => sub_wrapping(&l, &r),
-                    Operator::Multiply => mul_wrapping(&l, &r),
-                    Operator::Divide => div(&l, &r),
-                    Operator::Modulo => rem(&l, &r),
+                    Plus => add_wrapping(&l, &r),
+                    Minus => sub_wrapping(&l, &r),
+                    Multiply => mul_wrapping(&l, &r),
+                    Divide => div(&l, &r),
+                    Modulo => rem(&l, &r),
                     _ => unreachable!(),
                 };
                 result.map(|x| x.data_type().clone())
@@ -155,9 +153,9 @@ fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature>
                 // Temporal arithmetic by first coercing to a common time representation
                 // e.g. Date32 - Timestamp
                 let ret = get_result(&coerced, &coerced).map_err(|e| {
-                    DataFusionError::Plan(format!(
+                    plan_datafusion_err!(
                         "Cannot get result type for temporal operation {coerced} {op} {coerced}: {e}"
-                    ))
+                    )
                 })?;
                 Ok(Signature{
                     lhs: coerced.clone(),
@@ -167,9 +165,9 @@ fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature>
             } else if let Some((lhs, rhs)) = math_decimal_coercion(lhs, rhs) {
                 // Decimal arithmetic, e.g. Decimal(10, 2) + Decimal(10, 0)
                 let ret = get_result(&lhs, &rhs).map_err(|e| {
-                    DataFusionError::Plan(format!(
+                    plan_datafusion_err!(
                         "Cannot get result type for decimal operation {lhs} {op} {rhs}: {e}"
-                    ))
+                    )
                 })?;
                 Ok(Signature{
                     lhs,
@@ -225,7 +223,7 @@ fn math_decimal_coercion(
         (Null, dec_type @ Decimal128(_, _)) | (dec_type @ Decimal128(_, _), Null) => {
             Some((dec_type.clone(), dec_type.clone()))
         }
-        (Decimal128(_, _), Decimal128(_, _)) => {
+        (Decimal128(_, _), Decimal128(_, _)) | (Decimal256(_, _), Decimal256(_, _)) => {
             Some((lhs_type.clone(), rhs_type.clone()))
         }
         // Unlike with comparison we don't coerce to a decimal in the case of floating point
@@ -235,9 +233,6 @@ fn math_decimal_coercion(
         }
         (Int8 | Int16 | Int32 | Int64, Decimal128(_, _)) => {
             Some((coerce_numeric_type_to_decimal(lhs_type)?, rhs_type.clone()))
-        }
-        (Decimal256(_, _), Decimal256(_, _)) => {
-            Some((lhs_type.clone(), rhs_type.clone()))
         }
         (Decimal256(_, _), Int8 | Int16 | Int32 | Int64) => Some((
             lhs_type.clone(),
@@ -310,10 +305,10 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
 fn string_numeric_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
-        (Utf8, _) if is_numeric(rhs_type) => Some(Utf8),
-        (LargeUtf8, _) if is_numeric(rhs_type) => Some(LargeUtf8),
-        (_, Utf8) if is_numeric(lhs_type) => Some(Utf8),
-        (_, LargeUtf8) if is_numeric(lhs_type) => Some(LargeUtf8),
+        (Utf8, _) if rhs_type.is_numeric() => Some(Utf8),
+        (LargeUtf8, _) if rhs_type.is_numeric() => Some(LargeUtf8),
+        (_, Utf8) if lhs_type.is_numeric() => Some(Utf8),
+        (_, LargeUtf8) if lhs_type.is_numeric() => Some(LargeUtf8),
         _ => None,
     }
 }
@@ -365,7 +360,7 @@ fn comparison_binary_numeric_coercion(
     rhs_type: &DataType,
 ) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
-    if !is_numeric(lhs_type) || !is_numeric(rhs_type) {
+    if !lhs_type.is_numeric() || !rhs_type.is_numeric() {
         return None;
     };
 
@@ -470,6 +465,54 @@ fn get_wider_decimal_type(
     }
 }
 
+/// Returns the wider type among arguments `lhs` and `rhs`.
+/// The wider type is the type that can safely represent values from both types
+/// without information loss. Returns an Error if types are incompatible.
+pub fn get_wider_type(lhs: &DataType, rhs: &DataType) -> Result<DataType> {
+    use arrow::datatypes::DataType::*;
+    Ok(match (lhs, rhs) {
+        (lhs, rhs) if lhs == rhs => lhs.clone(),
+        // Right UInt is larger than left UInt.
+        (UInt8, UInt16 | UInt32 | UInt64) | (UInt16, UInt32 | UInt64) | (UInt32, UInt64) |
+        // Right Int is larger than left Int.
+        (Int8, Int16 | Int32 | Int64) | (Int16, Int32 | Int64) | (Int32, Int64) |
+        // Right Float is larger than left Float.
+        (Float16, Float32 | Float64) | (Float32, Float64) |
+        // Right String is larger than left String.
+        (Utf8, LargeUtf8) |
+        // Any right type is wider than a left hand side Null.
+        (Null, _) => rhs.clone(),
+        // Left UInt is larger than right UInt.
+        (UInt16 | UInt32 | UInt64, UInt8) | (UInt32 | UInt64, UInt16) | (UInt64, UInt32) |
+        // Left Int is larger than right Int.
+        (Int16 | Int32 | Int64, Int8) | (Int32 | Int64, Int16) | (Int64, Int32) |
+        // Left Float is larger than right Float.
+        (Float32 | Float64, Float16) | (Float64, Float32) |
+        // Left String is larget than right String.
+        (LargeUtf8, Utf8) |
+        // Any left type is wider than a right hand side Null.
+        (_, Null) => lhs.clone(),
+        (List(lhs_field), List(rhs_field)) => {
+            let field_type =
+                get_wider_type(lhs_field.data_type(), rhs_field.data_type())?;
+            if lhs_field.name() != rhs_field.name() {
+                return Err(exec_datafusion_err!(
+                    "There is no wider type that can represent both {lhs} and {rhs}."
+                ));
+            }
+            assert_eq!(lhs_field.name(), rhs_field.name());
+            let field_name = lhs_field.name();
+            let nullable = lhs_field.is_nullable() | rhs_field.is_nullable();
+            List(Arc::new(Field::new(field_name, field_type, nullable)))
+        }
+        (_, _) => {
+            return Err(exec_datafusion_err!(
+                "There is no wider type that can represent both {lhs} and {rhs}."
+            ));
+        }
+    })
+}
+
 /// Convert the numeric data type to the decimal data type.
 /// Now, we just support the signed integer type and floating-point type.
 fn coerce_numeric_type_to_decimal(numeric_type: &DataType) -> Option<DataType> {
@@ -563,14 +606,18 @@ fn create_decimal256_type(precision: u8, scale: i8) -> DataType {
 fn both_numeric_or_null_and_numeric(lhs_type: &DataType, rhs_type: &DataType) -> bool {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
-        (_, Null) => is_numeric(lhs_type),
-        (Null, _) => is_numeric(rhs_type),
+        (_, Null) => lhs_type.is_numeric(),
+        (Null, _) => rhs_type.is_numeric(),
         (Dictionary(_, lhs_value_type), Dictionary(_, rhs_value_type)) => {
-            is_numeric(lhs_value_type) && is_numeric(rhs_value_type)
+            lhs_value_type.is_numeric() && rhs_value_type.is_numeric()
         }
-        (Dictionary(_, value_type), _) => is_numeric(value_type) && is_numeric(rhs_type),
-        (_, Dictionary(_, value_type)) => is_numeric(lhs_type) && is_numeric(value_type),
-        _ => is_numeric(lhs_type) && is_numeric(rhs_type),
+        (Dictionary(_, value_type), _) => {
+            value_type.is_numeric() && rhs_type.is_numeric()
+        }
+        (_, Dictionary(_, value_type)) => {
+            lhs_type.is_numeric() && value_type.is_numeric()
+        }
+        _ => lhs_type.is_numeric() && rhs_type.is_numeric(),
     }
 }
 
@@ -645,8 +692,9 @@ fn string_concat_internal_coercion(
     }
 }
 
-/// Coercion rules for Strings: the type that both lhs and rhs can be
-/// casted to for the purpose of a string computation
+/// Coercion rules for string types (Utf8/LargeUtf8): If at least one argument is
+/// a string type and both arguments can be coerced into a string type, coerce
+/// to string type.
 fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
@@ -662,8 +710,30 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
     }
 }
 
-/// Coercion rules for Binaries: the type that both lhs and rhs can be
-/// casted to for the purpose of a computation
+/// Coercion rules for binary (Binary/LargeBinary) to string (Utf8/LargeUtf8):
+/// If one argument is binary and the other is a string then coerce to string
+/// (e.g. for `like`)
+fn binary_to_string_coercion(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+) -> Option<DataType> {
+    use arrow::datatypes::DataType::*;
+    match (lhs_type, rhs_type) {
+        (Binary, Utf8) => Some(Utf8),
+        (Binary, LargeUtf8) => Some(LargeUtf8),
+        (LargeBinary, Utf8) => Some(LargeUtf8),
+        (LargeBinary, LargeUtf8) => Some(LargeUtf8),
+        (Utf8, Binary) => Some(Utf8),
+        (Utf8, LargeBinary) => Some(LargeUtf8),
+        (LargeUtf8, Binary) => Some(LargeUtf8),
+        (LargeUtf8, LargeBinary) => Some(LargeUtf8),
+        _ => None,
+    }
+}
+
+/// Coercion rules for binary types (Binary/LargeBinary): If at least one argument is
+/// a binary type and both arguments can be coerced into a binary type, coerce
+/// to binary type.
 fn binary_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
@@ -678,6 +748,7 @@ fn binary_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
 /// This is a union of string coercion rules and dictionary coercion rules
 pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
+        .or_else(|| binary_to_string_coercion(lhs_type, rhs_type))
         .or_else(|| dictionary_coercion(lhs_type, rhs_type, false))
         .or_else(|| null_coercion(lhs_type, rhs_type))
 }
@@ -760,7 +831,7 @@ fn temporal_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
     }
 }
 
-/// coercion rules from NULL type. Since NULL can be casted to most of types in arrow,
+/// coercion rules from NULL type. Since NULL can be casted to any other type in arrow,
 /// either lhs or rhs is NULL, if NULL can be casted to type of the other side, the coercion is valid.
 fn null_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     match (lhs_type, rhs_type) {
@@ -777,14 +848,11 @@ fn null_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::DataType;
-
-    use datafusion_common::assert_contains;
-    use datafusion_common::Result;
-
+    use super::*;
     use crate::Operator;
 
-    use super::*;
+    use arrow::datatypes::DataType;
+    use datafusion_common::{assert_contains, Result};
 
     #[test]
     fn test_coercion_error() -> Result<()> {
@@ -914,11 +982,33 @@ mod tests {
         );
     }
 
+    /// Test coercion rules for binary operators
+    ///
+    /// Applies coercion rules for `$LHS_TYPE $OP $RHS_TYPE` and asserts that the
+    /// the result type is `$RESULT_TYPE`
     macro_rules! test_coercion_binary_rule {
-        ($A_TYPE:expr, $B_TYPE:expr, $OP:expr, $C_TYPE:expr) => {{
-            let (lhs, rhs) = get_input_types(&$A_TYPE, &$OP, &$B_TYPE)?;
-            assert_eq!(lhs, $C_TYPE);
-            assert_eq!(rhs, $C_TYPE);
+        ($LHS_TYPE:expr, $RHS_TYPE:expr, $OP:expr, $RESULT_TYPE:expr) => {{
+            let (lhs, rhs) = get_input_types(&$LHS_TYPE, &$OP, &$RHS_TYPE)?;
+            assert_eq!(lhs, $RESULT_TYPE);
+            assert_eq!(rhs, $RESULT_TYPE);
+        }};
+    }
+
+    /// Test coercion rules for like
+    ///
+    /// Applies coercion rules for both
+    /// * `$LHS_TYPE LIKE $RHS_TYPE`
+    /// * `$RHS_TYPE LIKE $LHS_TYPE`
+    ///
+    /// And asserts the result type is `$RESULT_TYPE`
+    macro_rules! test_like_rule {
+        ($LHS_TYPE:expr, $RHS_TYPE:expr, $RESULT_TYPE:expr) => {{
+            println!("Coercing {} LIKE {}", $LHS_TYPE, $RHS_TYPE);
+            let result = like_coercion(&$LHS_TYPE, &$RHS_TYPE);
+            assert_eq!(result, $RESULT_TYPE);
+            // reverse the order
+            let result = like_coercion(&$RHS_TYPE, &$LHS_TYPE);
+            assert_eq!(result, $RESULT_TYPE);
         }};
     }
 
@@ -945,11 +1035,46 @@ mod tests {
     }
 
     #[test]
-    fn test_type_coercion() -> Result<()> {
-        // test like coercion rule
-        let result = like_coercion(&DataType::Utf8, &DataType::Utf8);
-        assert_eq!(result, Some(DataType::Utf8));
+    fn test_like_coercion() {
+        // string coerce to strings
+        test_like_rule!(DataType::Utf8, DataType::Utf8, Some(DataType::Utf8));
+        test_like_rule!(
+            DataType::LargeUtf8,
+            DataType::Utf8,
+            Some(DataType::LargeUtf8)
+        );
+        test_like_rule!(
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            Some(DataType::LargeUtf8)
+        );
+        test_like_rule!(
+            DataType::LargeUtf8,
+            DataType::LargeUtf8,
+            Some(DataType::LargeUtf8)
+        );
 
+        // Also coerce binary to strings
+        test_like_rule!(DataType::Binary, DataType::Utf8, Some(DataType::Utf8));
+        test_like_rule!(
+            DataType::LargeBinary,
+            DataType::Utf8,
+            Some(DataType::LargeUtf8)
+        );
+        test_like_rule!(
+            DataType::Binary,
+            DataType::LargeUtf8,
+            Some(DataType::LargeUtf8)
+        );
+        test_like_rule!(
+            DataType::LargeBinary,
+            DataType::LargeUtf8,
+            Some(DataType::LargeUtf8)
+        );
+    }
+
+    #[test]
+    fn test_type_coercion() -> Result<()> {
         test_coercion_binary_rule!(
             DataType::Utf8,
             DataType::Date32,

@@ -17,6 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by DataFusion.
 
+use datafusion_physical_plan::metrics::MetricsSet;
 use futures::StreamExt;
 use log::debug;
 use std::any::Any;
@@ -54,7 +55,7 @@ pub type PartitionData = Arc<RwLock<Vec<RecordBatch>>>;
 pub struct MemTable {
     schema: SchemaRef,
     pub(crate) batches: Vec<PartitionData>,
-    constraints: Option<Constraints>,
+    constraints: Constraints,
 }
 
 impl MemTable {
@@ -77,15 +78,13 @@ impl MemTable {
                 .into_iter()
                 .map(|e| Arc::new(RwLock::new(e)))
                 .collect::<Vec<_>>(),
-            constraints: None,
+            constraints: Constraints::empty(),
         })
     }
 
     /// Assign constraints
     pub fn with_constraints(mut self, constraints: Constraints) -> Self {
-        if !constraints.is_empty() {
-            self.constraints = Some(constraints);
-        }
+        self.constraints = constraints;
         self
     }
 
@@ -164,7 +163,7 @@ impl TableProvider for MemTable {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        self.constraints.as_ref()
+        Some(&self.constraints)
     }
 
     fn table_type(&self) -> TableType {
@@ -210,7 +209,10 @@ impl TableProvider for MemTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
-        if !self.schema().equivalent_names_and_types(&input.schema()) {
+        if !self
+            .schema()
+            .logically_equivalent_names_and_types(&input.schema())
+        {
             return plan_err!(
                 "Inserting query must have the same schema with the table."
             );
@@ -223,6 +225,7 @@ impl TableProvider for MemTable {
             input,
             sink,
             self.schema.clone(),
+            None,
         )))
     }
 }
@@ -260,9 +263,17 @@ impl MemSink {
 
 #[async_trait]
 impl DataSink for MemSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        None
+    }
+
     async fn write_all(
         &self,
-        mut data: Vec<SendableRecordBatchStream>,
+        mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let num_partitions = self.batches.len();
@@ -272,14 +283,10 @@ impl DataSink for MemSink {
         let mut new_batches = vec![vec![]; num_partitions];
         let mut i = 0;
         let mut row_count = 0;
-        let num_parts = data.len();
-        // TODO parallelize outer and inner loops
-        for data_part in data.iter_mut().take(num_parts) {
-            while let Some(batch) = data_part.next().await.transpose()? {
-                row_count += batch.num_rows();
-                new_batches[i].push(batch);
-                i = (i + 1) % num_partitions;
-            }
+        while let Some(batch) = data.next().await.transpose()? {
+            row_count += batch.num_rows();
+            new_batches[i].push(batch);
+            i = (i + 1) % num_partitions;
         }
 
         // write the outputs into the batches

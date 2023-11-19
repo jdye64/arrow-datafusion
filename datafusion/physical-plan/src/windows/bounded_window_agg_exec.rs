@@ -30,7 +30,8 @@ use std::task::{Context, Poll};
 use crate::expressions::PhysicalSortExpr;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::windows::{
-    calc_requirements, get_ordered_partition_by_indices, window_ordering_equivalence,
+    calc_requirements, get_ordered_partition_by_indices, get_partition_by_sort_exprs,
+    window_equivalence_properties, PartitionSearchMode,
 };
 use crate::{
     ColumnStatistics, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
@@ -43,8 +44,8 @@ use arrow::{
     datatypes::{Schema, SchemaBuilder, SchemaRef},
     record_batch::RecordBatch,
 };
-
 use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::stats::Precision;
 use datafusion_common::utils::{
     evaluate_partition_ranges, get_arrayref_at_indices, get_at_indices,
     get_record_batch_at_indices, get_row_at_idx,
@@ -57,8 +58,7 @@ use datafusion_physical_expr::window::{
     PartitionBatches, PartitionKey, PartitionWindowAggStates, WindowState,
 };
 use datafusion_physical_expr::{
-    EquivalenceProperties, OrderingEquivalenceProperties, PhysicalExpr,
-    PhysicalSortRequirement,
+    EquivalenceProperties, PhysicalExpr, PhysicalSortRequirement,
 };
 
 use ahash::RandomState;
@@ -67,17 +67,6 @@ use futures::{ready, StreamExt};
 use hashbrown::raw::RawTable;
 use indexmap::IndexMap;
 use log::debug;
-
-#[derive(Debug, Clone, PartialEq)]
-/// Specifies partition column properties in terms of input ordering
-pub enum PartitionSearchMode {
-    /// None of the columns among the partition columns is ordered.
-    Linear,
-    /// Some columns of the partition columns are ordered but not all
-    PartiallySorted(Vec<usize>),
-    /// All Partition columns are ordered (Also empty case)
-    Sorted,
-}
 
 /// Window execution plan
 #[derive(Debug)]
@@ -88,8 +77,6 @@ pub struct BoundedWindowAggExec {
     window_expr: Vec<Arc<dyn WindowExpr>>,
     /// Schema after the window is run
     schema: SchemaRef,
-    /// Schema before the window
-    input_schema: SchemaRef,
     /// Partition Keys
     pub partition_keys: Vec<Arc<dyn PhysicalExpr>>,
     /// Execution metrics
@@ -110,11 +97,10 @@ impl BoundedWindowAggExec {
     pub fn try_new(
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: Arc<dyn ExecutionPlan>,
-        input_schema: SchemaRef,
         partition_keys: Vec<Arc<dyn PhysicalExpr>>,
         partition_search_mode: PartitionSearchMode,
     ) -> Result<Self> {
-        let schema = create_schema(&input_schema, &window_expr)?;
+        let schema = create_schema(&input.schema(), &window_expr)?;
         let schema = Arc::new(schema);
         let partition_by_exprs = window_expr[0].partition_by();
         let ordered_partition_by_indices = match &partition_search_mode {
@@ -140,7 +126,6 @@ impl BoundedWindowAggExec {
             input,
             window_expr,
             schema,
-            input_schema,
             partition_keys,
             metrics: ExecutionPlanMetricsSet::new(),
             partition_search_mode,
@@ -158,20 +143,18 @@ impl BoundedWindowAggExec {
         &self.input
     }
 
-    /// Get the input schema before any window functions are applied
-    pub fn input_schema(&self) -> SchemaRef {
-        self.input_schema.clone()
-    }
-
     /// Return the output sort order of partition keys: For example
     /// OVER(PARTITION BY a, ORDER BY b) -> would give sorting of the column a
     // We are sure that partition by columns are always at the beginning of sort_keys
     // Hence returned `PhysicalSortExpr` corresponding to `PARTITION BY` columns can be used safely
     // to calculate partition separation points
     pub fn partition_by_sort_keys(&self) -> Result<Vec<PhysicalSortExpr>> {
-        // Partition by sort keys indices are stored in self.ordered_partition_by_indices.
-        let sort_keys = self.input.output_ordering().unwrap_or(&[]);
-        get_at_indices(sort_keys, &self.ordered_partition_by_indices)
+        let partition_by = self.window_expr()[0].partition_by();
+        get_partition_by_sort_exprs(
+            &self.input,
+            partition_by,
+            &self.ordered_partition_by_indices,
+        )
     }
 
     /// Initializes the appropriate [`PartitionSearcher`] implementation from
@@ -283,13 +266,9 @@ impl ExecutionPlan for BoundedWindowAggExec {
         }
     }
 
+    /// Get the [`EquivalenceProperties`] within the plan
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input().equivalence_properties()
-    }
-
-    /// Get the OrderingEquivalenceProperties within the plan
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        window_ordering_equivalence(&self.schema, &self.input, &self.window_expr)
+        window_equivalence_properties(&self.schema, &self.input, &self.window_expr)
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -303,7 +282,6 @@ impl ExecutionPlan for BoundedWindowAggExec {
         Ok(Arc::new(BoundedWindowAggExec::try_new(
             self.window_expr.clone(),
             children[0].clone(),
-            self.input_schema.clone(),
             self.partition_keys.clone(),
             self.partition_search_mode.clone(),
         )?))
@@ -330,24 +308,22 @@ impl ExecutionPlan for BoundedWindowAggExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        let input_stat = self.input.statistics();
+    fn statistics(&self) -> Result<Statistics> {
+        let input_stat = self.input.statistics()?;
         let win_cols = self.window_expr.len();
-        let input_cols = self.input_schema.fields().len();
+        let input_cols = self.input.schema().fields().len();
         // TODO stats: some windowing function will maintain invariants such as min, max...
         let mut column_statistics = Vec::with_capacity(win_cols + input_cols);
-        if let Some(input_col_stats) = input_stat.column_statistics {
-            column_statistics.extend(input_col_stats);
-        } else {
-            column_statistics.extend(vec![ColumnStatistics::default(); input_cols]);
+        // copy stats of the input to the beginning of the schema.
+        column_statistics.extend(input_stat.column_statistics);
+        for _ in 0..win_cols {
+            column_statistics.push(ColumnStatistics::new_unknown())
         }
-        column_statistics.extend(vec![ColumnStatistics::default(); win_cols]);
-        Statistics {
-            is_exact: input_stat.is_exact,
+        Ok(Statistics {
             num_rows: input_stat.num_rows,
-            column_statistics: Some(column_statistics),
-            total_byte_size: None,
-        }
+            column_statistics,
+            total_byte_size: Precision::Absent,
+        })
     }
 }
 

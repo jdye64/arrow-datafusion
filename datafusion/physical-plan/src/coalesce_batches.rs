@@ -23,9 +23,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use super::expressions::PhysicalSortExpr;
+use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use super::{DisplayAs, Statistics};
 use crate::{
-    DisplayFormatType, EquivalenceProperties, ExecutionPlan, Partitioning,
-    RecordBatchStream, SendableRecordBatchStream,
+    DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
+    SendableRecordBatchStream,
 };
 
 use arrow::datatypes::SchemaRef;
@@ -33,12 +36,7 @@ use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::OrderingEquivalenceProperties;
-
-use super::expressions::PhysicalSortExpr;
-use super::metrics::{BaselineMetrics, MetricsSet};
-use super::DisplayAs;
-use super::{metrics::ExecutionPlanMetricsSet, Statistics};
+use datafusion_physical_expr::EquivalenceProperties;
 
 use futures::stream::{Stream, StreamExt};
 use log::trace;
@@ -140,10 +138,6 @@ impl ExecutionPlan for CoalesceBatchesExec {
         self.input.equivalence_properties()
     }
 
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        self.input.ordering_equivalence_properties()
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -174,7 +168,7 @@ impl ExecutionPlan for CoalesceBatchesExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
     }
 }
@@ -230,17 +224,17 @@ impl CoalesceBatchesStream {
             let _timer = cloned_time.timer();
             match input_batch {
                 Poll::Ready(x) => match x {
-                    Some(Ok(ref batch)) => {
+                    Some(Ok(batch)) => {
                         if batch.num_rows() >= self.target_batch_size
                             && self.buffer.is_empty()
                         {
-                            return Poll::Ready(Some(Ok(batch.clone())));
+                            return Poll::Ready(Some(Ok(batch)));
                         } else if batch.num_rows() == 0 {
                             // discard empty batches
                         } else {
                             // add to the buffered batches
-                            self.buffer.push(batch.clone());
                             self.buffered_rows += batch.num_rows();
+                            self.buffer.push(batch);
                             // check to see if we have enough batches yet
                             if self.buffered_rows >= self.target_batch_size {
                                 // combine the batches and return
@@ -302,14 +296,14 @@ pub fn concat_batches(
         batches.len(),
         row_count
     );
-    let b = arrow::compute::concat_batches(schema, batches)?;
-    Ok(b)
+    arrow::compute::concat_batches(schema, batches)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{memory::MemoryExec, repartition::RepartitionExec};
+
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::UInt32Array;
 

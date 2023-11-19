@@ -16,11 +16,17 @@
 // under the License.
 
 //! [`SessionContext`] contains methods for registering data sources and executing queries
+
+mod avro;
+mod csv;
+mod json;
+#[cfg(feature = "parquet")]
+mod parquet;
+
 use crate::{
     catalog::{CatalogList, MemoryCatalogList},
     datasource::{
         listing::{ListingOptions, ListingTable},
-        listing_table_factory::ListingTableFactory,
         provider::TableProviderFactory,
     },
     datasource::{MemTable, ViewTable},
@@ -30,7 +36,7 @@ use crate::{
 };
 use datafusion_common::{
     alias::AliasGenerator,
-    exec_err, not_impl_err, plan_err,
+    exec_err, not_impl_err, plan_datafusion_err, plan_err,
     tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
 };
 use datafusion_execution::registry::SerializerRegistry;
@@ -77,7 +83,6 @@ use datafusion_sql::{
 use sqlparser::dialect::dialect_from_str;
 
 use crate::config::ConfigOptions;
-use crate::datasource::physical_plan::{plan_to_csv, plan_to_json, plan_to_parquet};
 use crate::execution::{runtime_env::RuntimeEnv, FunctionRegistry};
 use crate::physical_plan::udaf::AggregateUDF;
 use crate::physical_plan::udf::ScalarUDF;
@@ -92,7 +97,6 @@ use datafusion_sql::{
     parser::DFParser,
     planner::{ContextProvider, SqlToRel},
 };
-use parquet::file::properties::WriterProperties;
 use url::Url;
 
 use crate::catalog::information_schema::{InformationSchemaProvider, INFORMATION_SCHEMA};
@@ -106,13 +110,12 @@ use datafusion_sql::planner::object_name_to_table_reference;
 use uuid::Uuid;
 
 // backwards compatibility
+use crate::datasource::provider::DefaultTableFactory;
 use crate::execution::options::ArrowReadOptions;
 pub use datafusion_execution::config::SessionConfig;
 pub use datafusion_execution::TaskContext;
 
-use super::options::{
-    AvroReadOptions, CsvReadOptions, NdJsonReadOptions, ParquetReadOptions, ReadOptions,
-};
+use super::options::ReadOptions;
 
 /// DataFilePaths adds a method to convert strings and vector of strings to vector of [`ListingTableUrl`] URLs.
 /// This allows methods such [`SessionContext::read_csv`] and [`SessionContext::read_avro`]
@@ -258,7 +261,7 @@ impl Default for SessionContext {
 impl SessionContext {
     /// Creates a new `SessionContext` using the default [`SessionConfig`].
     pub fn new() -> Self {
-        Self::with_config(SessionConfig::new())
+        Self::new_with_config(SessionConfig::new())
     }
 
     /// Finds any [`ListingSchemaProvider`]s and instructs them to reload tables from "disk"
@@ -284,11 +287,18 @@ impl SessionContext {
     /// Creates a new `SessionContext` using the provided
     /// [`SessionConfig`] and a new [`RuntimeEnv`].
     ///
-    /// See [`Self::with_config_rt`] for more details on resource
+    /// See [`Self::new_with_config_rt`] for more details on resource
     /// limits.
-    pub fn with_config(config: SessionConfig) -> Self {
+    pub fn new_with_config(config: SessionConfig) -> Self {
         let runtime = Arc::new(RuntimeEnv::default());
-        Self::with_config_rt(config, runtime)
+        Self::new_with_config_rt(config, runtime)
+    }
+
+    /// Creates a new `SessionContext` using the provided
+    /// [`SessionConfig`] and a new [`RuntimeEnv`].
+    #[deprecated(since = "32.0.0", note = "Use SessionContext::new_with_config")]
+    pub fn with_config(config: SessionConfig) -> Self {
+        Self::new_with_config(config)
     }
 
     /// Creates a new `SessionContext` using the provided
@@ -304,13 +314,20 @@ impl SessionContext {
     /// memory used) across all DataFusion queries in a process,
     /// all `SessionContext`'s should be configured with the
     /// same `RuntimeEnv`.
+    pub fn new_with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
+        let state = SessionState::new_with_config_rt(config, runtime);
+        Self::new_with_state(state)
+    }
+
+    /// Creates a new `SessionContext` using the provided
+    /// [`SessionConfig`] and a [`RuntimeEnv`].
+    #[deprecated(since = "32.0.0", note = "Use SessionState::new_with_config_rt")]
     pub fn with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
-        let state = SessionState::with_config_rt(config, runtime);
-        Self::with_state(state)
+        Self::new_with_config_rt(config, runtime)
     }
 
     /// Creates a new `SessionContext` using the provided [`SessionState`]
-    pub fn with_state(state: SessionState) -> Self {
+    pub fn new_with_state(state: SessionState) -> Self {
         Self {
             session_id: state.session_id.clone(),
             session_start_time: Utc::now(),
@@ -318,6 +335,11 @@ impl SessionContext {
         }
     }
 
+    /// Creates a new `SessionContext` using the provided [`SessionState`]
+    #[deprecated(since = "32.0.0", note = "Use SessionState::new_with_state")]
+    pub fn with_state(state: SessionState) -> Self {
+        Self::new_with_state(state)
+    }
     /// Returns the time this `SessionContext` was created
     pub fn session_start_time(&self) -> DateTime<Utc> {
         self.session_start_time
@@ -784,7 +806,7 @@ impl SessionContext {
         self.state
             .write()
             .scalar_functions
-            .insert(f.name.clone(), Arc::new(f));
+            .insert(f.name().to_string(), Arc::new(f));
     }
 
     /// Registers an aggregate UDF within this context.
@@ -798,7 +820,7 @@ impl SessionContext {
         self.state
             .write()
             .aggregate_functions
-            .insert(f.name.clone(), Arc::new(f));
+            .insert(f.name().to_string(), Arc::new(f));
     }
 
     /// Registers a window UDF within this context.
@@ -812,7 +834,7 @@ impl SessionContext {
         self.state
             .write()
             .window_functions
-            .insert(f.name.clone(), Arc::new(f));
+            .insert(f.name().to_string(), Arc::new(f));
     }
 
     /// Creates a [`DataFrame`] for reading a data source.
@@ -827,6 +849,23 @@ impl SessionContext {
         let table_paths = table_paths.to_urls()?;
         let session_config = self.copied_config();
         let listing_options = options.to_listing_options(&session_config);
+
+        let option_extension = listing_options.file_extension.clone();
+
+        if table_paths.is_empty() {
+            return exec_err!("No table paths were provided");
+        }
+
+        // check if the file extension matches the expected extension
+        for path in &table_paths {
+            let file_name = path.prefix().filename().unwrap_or_default();
+            if !path.as_str().ends_with(&option_extension) && file_name.contains('.') {
+                return exec_err!(
+                    "File '{file_name}' does not match the expected extension '{option_extension}'"
+                );
+            }
+        }
+
         let resolved_schema = options
             .get_resolved_schema(&session_config, self.state(), table_paths[0].clone())
             .await?;
@@ -835,34 +874,6 @@ impl SessionContext {
             .with_schema(resolved_schema);
         let provider = ListingTable::try_new(config)?;
         self.read_table(Arc::new(provider))
-    }
-
-    /// Creates a [`DataFrame`] for reading an Avro data source.
-    ///
-    /// For more control such as reading multiple files, you can use
-    /// [`read_table`](Self::read_table) with a [`ListingTable`].
-    ///
-    /// For an example, see [`read_csv`](Self::read_csv)
-    pub async fn read_avro<P: DataFilePaths>(
-        &self,
-        table_paths: P,
-        options: AvroReadOptions<'_>,
-    ) -> Result<DataFrame> {
-        self._read_type(table_paths, options).await
-    }
-
-    /// Creates a [`DataFrame`] for reading an JSON data source.
-    ///
-    /// For more control such as reading multiple files, you can use
-    /// [`read_table`](Self::read_table) with a [`ListingTable`].
-    ///
-    /// For an example, see [`read_csv`](Self::read_csv)
-    pub async fn read_json<P: DataFilePaths>(
-        &self,
-        table_paths: P,
-        options: NdJsonReadOptions<'_>,
-    ) -> Result<DataFrame> {
-        self._read_type(table_paths, options).await
     }
 
     /// Creates a [`DataFrame`] for reading an Arrow data source.
@@ -885,48 +896,6 @@ impl SessionContext {
             self.state(),
             LogicalPlanBuilder::empty(true).build()?,
         ))
-    }
-
-    /// Creates a [`DataFrame`] for reading a CSV data source.
-    ///
-    /// For more control such as reading multiple files, you can use
-    /// [`read_table`](Self::read_table) with a [`ListingTable`].
-    ///
-    /// Example usage is given below:
-    ///
-    /// ```
-    /// use datafusion::prelude::*;
-    /// # use datafusion::error::Result;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let ctx = SessionContext::new();
-    /// // You can read a single file using `read_csv`
-    /// let df = ctx.read_csv("tests/data/example.csv", CsvReadOptions::new()).await?;
-    /// // you can also read multiple files:
-    /// let df = ctx.read_csv(vec!["tests/data/example.csv", "tests/data/example.csv"], CsvReadOptions::new()).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn read_csv<P: DataFilePaths>(
-        &self,
-        table_paths: P,
-        options: CsvReadOptions<'_>,
-    ) -> Result<DataFrame> {
-        self._read_type(table_paths, options).await
-    }
-
-    /// Creates a [`DataFrame`] for reading a Parquet data source.
-    ///
-    /// For more control such as reading multiple files, you can use
-    /// [`read_table`](Self::read_table) with a [`ListingTable`].
-    ///
-    /// For an example, see [`read_csv`](Self::read_csv)
-    pub async fn read_parquet<P: DataFilePaths>(
-        &self,
-        table_paths: P,
-        options: ParquetReadOptions<'_>,
-    ) -> Result<DataFrame> {
-        self._read_type(table_paths, options).await
     }
 
     /// Creates a [`DataFrame`] for a [`TableProvider`] such as a
@@ -986,91 +955,6 @@ impl SessionContext {
             TableReference::Bare { table: name.into() },
             Arc::new(table),
         )?;
-        Ok(())
-    }
-
-    /// Registers a CSV file as a table which can referenced from SQL
-    /// statements executed against this context.
-    pub async fn register_csv(
-        &self,
-        name: &str,
-        table_path: &str,
-        options: CsvReadOptions<'_>,
-    ) -> Result<()> {
-        let listing_options = options.to_listing_options(&self.copied_config());
-
-        self.register_listing_table(
-            name,
-            table_path,
-            listing_options,
-            options.schema.map(|s| Arc::new(s.to_owned())),
-            None,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Registers a JSON file as a table that it can be referenced
-    /// from SQL statements executed against this context.
-    pub async fn register_json(
-        &self,
-        name: &str,
-        table_path: &str,
-        options: NdJsonReadOptions<'_>,
-    ) -> Result<()> {
-        let listing_options = options.to_listing_options(&self.copied_config());
-
-        self.register_listing_table(
-            name,
-            table_path,
-            listing_options,
-            options.schema.map(|s| Arc::new(s.to_owned())),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Registers a Parquet file as a table that can be referenced from SQL
-    /// statements executed against this context.
-    pub async fn register_parquet(
-        &self,
-        name: &str,
-        table_path: &str,
-        options: ParquetReadOptions<'_>,
-    ) -> Result<()> {
-        let listing_options = options.to_listing_options(&self.state.read().config);
-
-        self.register_listing_table(
-            name,
-            table_path,
-            listing_options,
-            options.schema.map(|s| Arc::new(s.to_owned())),
-            None,
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Registers an Avro file as a table that can be referenced from
-    /// SQL statements executed against this context.
-    pub async fn register_avro(
-        &self,
-        name: &str,
-        table_path: &str,
-        options: AvroReadOptions<'_>,
-    ) -> Result<()> {
-        let listing_options = options.to_listing_options(&self.copied_config());
-
-        self.register_listing_table(
-            name,
-            table_path,
-            listing_options,
-            options.schema.map(|s| Arc::new(s.to_owned())),
-            None,
-        )
-        .await?;
         Ok(())
     }
 
@@ -1249,34 +1133,6 @@ impl SessionContext {
         self.state().create_physical_plan(logical_plan).await
     }
 
-    /// Executes a query and writes the results to a partitioned CSV file.
-    pub async fn write_csv(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        path: impl AsRef<str>,
-    ) -> Result<()> {
-        plan_to_csv(self.task_ctx(), plan, path).await
-    }
-
-    /// Executes a query and writes the results to a partitioned JSON file.
-    pub async fn write_json(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        path: impl AsRef<str>,
-    ) -> Result<()> {
-        plan_to_json(self.task_ctx(), plan, path).await
-    }
-
-    /// Executes a query and writes the results to a partitioned Parquet file.
-    pub async fn write_parquet(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        path: impl AsRef<str>,
-        writer_properties: Option<WriterProperties>,
-    ) -> Result<()> {
-        plan_to_parquet(self.task_ctx(), plan, path, writer_properties).await
-    }
-
     /// Get a new TaskContext to run in this session
     pub fn task_ctx(&self) -> Arc<TaskContext> {
         Arc::new(TaskContext::from(self))
@@ -1401,25 +1257,24 @@ impl Debug for SessionState {
     }
 }
 
-/// Default session builder using the provided configuration
-#[deprecated(
-    since = "23.0.0",
-    note = "See SessionContext::with_config() or SessionState::with_config_rt"
-)]
-pub fn default_session_builder(config: SessionConfig) -> SessionState {
-    SessionState::with_config_rt(config, Arc::new(RuntimeEnv::default()))
-}
-
 impl SessionState {
     /// Returns new [`SessionState`] using the provided
     /// [`SessionConfig`] and [`RuntimeEnv`].
-    pub fn with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
+    pub fn new_with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
         let catalog_list = Arc::new(MemoryCatalogList::new()) as Arc<dyn CatalogList>;
-        Self::with_config_rt_and_catalog_list(config, runtime, catalog_list)
+        Self::new_with_config_rt_and_catalog_list(config, runtime, catalog_list)
     }
 
-    /// Returns new SessionState using the provided configuration, runtime and catalog list.
-    pub fn with_config_rt_and_catalog_list(
+    /// Returns new [`SessionState`] using the provided
+    /// [`SessionConfig`] and [`RuntimeEnv`].
+    #[deprecated(since = "32.0.0", note = "Use SessionState::new_with_config_rt")]
+    pub fn with_config_rt(config: SessionConfig, runtime: Arc<RuntimeEnv>) -> Self {
+        Self::new_with_config_rt(config, runtime)
+    }
+
+    /// Returns new [`SessionState`] using the provided
+    /// [`SessionConfig`],  [`RuntimeEnv`], and [`CatalogList`]
+    pub fn new_with_config_rt_and_catalog_list(
         config: SessionConfig,
         runtime: Arc<RuntimeEnv>,
         catalog_list: Arc<dyn CatalogList>,
@@ -1429,12 +1284,13 @@ impl SessionState {
         // Create table_factories for all default formats
         let mut table_factories: HashMap<String, Arc<dyn TableProviderFactory>> =
             HashMap::new();
-        table_factories.insert("PARQUET".into(), Arc::new(ListingTableFactory::new()));
-        table_factories.insert("CSV".into(), Arc::new(ListingTableFactory::new()));
-        table_factories.insert("JSON".into(), Arc::new(ListingTableFactory::new()));
-        table_factories.insert("NDJSON".into(), Arc::new(ListingTableFactory::new()));
-        table_factories.insert("AVRO".into(), Arc::new(ListingTableFactory::new()));
-        table_factories.insert("ARROW".into(), Arc::new(ListingTableFactory::new()));
+        #[cfg(feature = "parquet")]
+        table_factories.insert("PARQUET".into(), Arc::new(DefaultTableFactory::new()));
+        table_factories.insert("CSV".into(), Arc::new(DefaultTableFactory::new()));
+        table_factories.insert("JSON".into(), Arc::new(DefaultTableFactory::new()));
+        table_factories.insert("NDJSON".into(), Arc::new(DefaultTableFactory::new()));
+        table_factories.insert("AVRO".into(), Arc::new(DefaultTableFactory::new()));
+        table_factories.insert("ARROW".into(), Arc::new(DefaultTableFactory::new()));
 
         if config.create_default_catalog_and_schema() {
             let default_catalog = MemoryCatalogProvider::new();
@@ -1476,7 +1332,19 @@ impl SessionState {
             table_factories,
         }
     }
-
+    /// Returns new [`SessionState`] using the provided
+    /// [`SessionConfig`] and [`RuntimeEnv`].
+    #[deprecated(
+        since = "32.0.0",
+        note = "Use SessionState::new_with_config_rt_and_catalog_list"
+    )]
+    pub fn with_config_rt_and_catalog_list(
+        config: SessionConfig,
+        runtime: Arc<RuntimeEnv>,
+        catalog_list: Arc<dyn CatalogList>,
+    ) -> Self {
+        Self::new_with_config_rt_and_catalog_list(config, runtime, catalog_list)
+    }
     fn register_default_schema(
         config: &SessionConfig,
         table_factories: &HashMap<String, Arc<dyn TableProviderFactory>>,
@@ -1547,17 +1415,14 @@ impl SessionState {
         self.catalog_list
             .catalog(&resolved_ref.catalog)
             .ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "failed to resolve catalog: {}",
                     resolved_ref.catalog
-                ))
+                )
             })?
             .schema(&resolved_ref.schema)
             .ok_or_else(|| {
-                DataFusionError::Plan(format!(
-                    "failed to resolve schema: {}",
-                    resolved_ref.schema
-                ))
+                plan_datafusion_err!("failed to resolve schema: {}", resolved_ref.schema)
             })
     }
 
@@ -1659,11 +1524,11 @@ impl SessionState {
         dialect: &str,
     ) -> Result<datafusion_sql::parser::Statement> {
         let dialect = dialect_from_str(dialect).ok_or_else(|| {
-            DataFusionError::Plan(format!(
+            plan_datafusion_err!(
                 "Unsupported SQL dialect: {dialect}. Available dialects: \
                      Generic, MySQL, PostgreSQL, Hive, SQLite, Snowflake, Redshift, \
                      MsSQL, ClickHouse, BigQuery, Ansi."
-            ))
+            )
         })?;
         let mut statements = DFParser::parse_sql_with_dialect(sql, dialect.as_ref())?;
         if statements.len() > 1 {
@@ -1987,12 +1852,12 @@ struct SessionContextProvider<'a> {
 }
 
 impl<'a> ContextProvider for SessionContextProvider<'a> {
-    fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
+    fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
         let name = self.state.resolve_table_ref(name).to_string();
         self.tables
             .get(&name)
             .cloned()
-            .ok_or_else(|| DataFusionError::Plan(format!("table '{name}' not found")))
+            .ok_or_else(|| plan_datafusion_err!("table '{name}' not found"))
     }
 
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
@@ -2039,9 +1904,7 @@ impl FunctionRegistry for SessionState {
         let result = self.scalar_functions.get(name);
 
         result.cloned().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "There is no UDF named \"{name}\" in the registry"
-            ))
+            plan_datafusion_err!("There is no UDF named \"{name}\" in the registry")
         })
     }
 
@@ -2049,9 +1912,7 @@ impl FunctionRegistry for SessionState {
         let result = self.aggregate_functions.get(name);
 
         result.cloned().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "There is no UDAF named \"{name}\" in the registry"
-            ))
+            plan_datafusion_err!("There is no UDAF named \"{name}\" in the registry")
         })
     }
 
@@ -2059,9 +1920,7 @@ impl FunctionRegistry for SessionState {
         let result = self.window_functions.get(name);
 
         result.cloned().ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "There is no UDWF named \"{name}\" in the registry"
-            ))
+            plan_datafusion_err!("There is no UDWF named \"{name}\" in the registry")
         })
     }
 }
@@ -2217,25 +2076,21 @@ impl<'a> TreeNodeVisitor for BadPlanVisitor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::options::CsvReadOptions;
     use super::*;
     use crate::assert_batches_eq;
     use crate::execution::context::QueryPlanner;
     use crate::execution::memory_pool::MemoryConsumer;
     use crate::execution::runtime_env::RuntimeConfig;
-    use crate::physical_plan::expressions::AvgAccumulator;
     use crate::test;
-    use crate::test_util::parquet_test_data;
+    use crate::test_util::{plan_and_collect, populate_csv_partitions};
     use crate::variable::VarType;
-    use arrow::array::ArrayRef;
-    use arrow::record_batch::RecordBatch;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::Schema;
     use async_trait::async_trait;
-    use datafusion_expr::{create_udaf, create_udf, Expr, Volatility};
-    use datafusion_physical_expr::functions::make_scalar_function;
-    use std::fs::File;
+    use datafusion_expr::Expr;
+    use std::env;
     use std::path::PathBuf;
     use std::sync::Weak;
-    use std::{env, io::prelude::*};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -2253,7 +2108,7 @@ mod tests {
         let disk_manager = ctx1.runtime_env().disk_manager.clone();
 
         let ctx2 =
-            SessionContext::with_config_rt(SessionConfig::new(), ctx1.runtime_env());
+            SessionContext::new_with_config_rt(SessionConfig::new(), ctx1.runtime_env());
 
         assert_eq!(ctx1.runtime_env().memory_pool.reserved(), 100);
         assert_eq!(ctx2.runtime_env().memory_pool.reserved(), 100);
@@ -2331,120 +2186,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn case_sensitive_identifiers_user_defined_functions() -> Result<()> {
-        let ctx = SessionContext::new();
-        ctx.register_table("t", test::table_with_sequence(1, 1).unwrap())
-            .unwrap();
-
-        let myfunc = |args: &[ArrayRef]| Ok(Arc::clone(&args[0]));
-        let myfunc = make_scalar_function(myfunc);
-
-        ctx.register_udf(create_udf(
-            "MY_FUNC",
-            vec![DataType::Int32],
-            Arc::new(DataType::Int32),
-            Volatility::Immutable,
-            myfunc,
-        ));
-
-        // doesn't work as it was registered with non lowercase
-        let err = plan_and_collect(&ctx, "SELECT MY_FUNC(i) FROM t")
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Error during planning: Invalid function \'my_func\'"));
-
-        // Can call it if you put quotes
-        let result = plan_and_collect(&ctx, "SELECT \"MY_FUNC\"(i) FROM t").await?;
-
-        let expected = [
-            "+--------------+",
-            "| MY_FUNC(t.i) |",
-            "+--------------+",
-            "| 1            |",
-            "+--------------+",
-        ];
-        assert_batches_eq!(expected, &result);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn case_sensitive_identifiers_user_defined_aggregates() -> Result<()> {
-        let ctx = SessionContext::new();
-        ctx.register_table("t", test::table_with_sequence(1, 1).unwrap())
-            .unwrap();
-
-        // Note capitalization
-        let my_avg = create_udaf(
-            "MY_AVG",
-            vec![DataType::Float64],
-            Arc::new(DataType::Float64),
-            Volatility::Immutable,
-            Arc::new(|_| Ok(Box::<AvgAccumulator>::default())),
-            Arc::new(vec![DataType::UInt64, DataType::Float64]),
-        );
-
-        ctx.register_udaf(my_avg);
-
-        // doesn't work as it was registered as non lowercase
-        let err = plan_and_collect(&ctx, "SELECT MY_AVG(i) FROM t")
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Error during planning: Invalid function \'my_avg\'"));
-
-        // Can call it if you put quotes
-        let result = plan_and_collect(&ctx, "SELECT \"MY_AVG\"(i) FROM t").await?;
-
-        let expected = [
-            "+-------------+",
-            "| MY_AVG(t.i) |",
-            "+-------------+",
-            "| 1.0         |",
-            "+-------------+",
-        ];
-        assert_batches_eq!(expected, &result);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn query_csv_with_custom_partition_extension() -> Result<()> {
-        let tmp_dir = TempDir::new()?;
-
-        // The main stipulation of this test: use a file extension that isn't .csv.
-        let file_extension = ".tst";
-
-        let ctx = SessionContext::new();
-        let schema = populate_csv_partitions(&tmp_dir, 2, file_extension)?;
-        ctx.register_csv(
-            "test",
-            tmp_dir.path().to_str().unwrap(),
-            CsvReadOptions::new()
-                .schema(&schema)
-                .file_extension(file_extension),
-        )
-        .await?;
-        let results =
-            plan_and_collect(&ctx, "SELECT SUM(c1), SUM(c2), COUNT(*) FROM test").await?;
-
-        assert_eq!(results.len(), 1);
-        let expected = [
-            "+--------------+--------------+----------+",
-            "| SUM(test.c1) | SUM(test.c2) | COUNT(*) |",
-            "+--------------+--------------+----------+",
-            "| 10           | 110          | 20       |",
-            "+--------------+--------------+----------+",
-        ];
-        assert_batches_eq!(expected, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn send_context_to_threads() -> Result<()> {
         // ensure SessionContexts can be used in a multi-threaded
         // environment. Usecase is for concurrent planing.
@@ -2481,8 +2222,8 @@ mod tests {
             .set_str("datafusion.catalog.location", url.as_str())
             .set_str("datafusion.catalog.format", "CSV")
             .set_str("datafusion.catalog.has_header", "true");
-        let session_state = SessionState::with_config_rt(cfg, runtime);
-        let ctx = SessionContext::with_state(session_state);
+        let session_state = SessionState::new_with_config_rt(cfg, runtime);
+        let ctx = SessionContext::new_with_state(session_state);
         ctx.refresh_catalogs().await?;
 
         let result =
@@ -2507,9 +2248,10 @@ mod tests {
     #[tokio::test]
     async fn custom_query_planner() -> Result<()> {
         let runtime = Arc::new(RuntimeEnv::default());
-        let session_state = SessionState::with_config_rt(SessionConfig::new(), runtime)
-            .with_query_planner(Arc::new(MyQueryPlanner {}));
-        let ctx = SessionContext::with_state(session_state);
+        let session_state =
+            SessionState::new_with_config_rt(SessionConfig::new(), runtime)
+                .with_query_planner(Arc::new(MyQueryPlanner {}));
+        let ctx = SessionContext::new_with_state(session_state);
 
         let df = ctx.sql("SELECT 1").await?;
         df.collect().await.expect_err("query not supported");
@@ -2518,7 +2260,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_default_catalog_and_schema() -> Result<()> {
-        let ctx = SessionContext::with_config(
+        let ctx = SessionContext::new_with_config(
             SessionConfig::new().with_create_default_catalog_and_schema(false),
         );
 
@@ -2561,7 +2303,7 @@ mod tests {
     }
 
     async fn catalog_and_schema_test(config: SessionConfig) {
-        let ctx = SessionContext::with_config(config);
+        let ctx = SessionContext::new_with_config(config);
         let catalog = MemoryCatalogProvider::new();
         let schema = MemorySchemaProvider::new();
         schema
@@ -2638,7 +2380,7 @@ mod tests {
     #[tokio::test]
     async fn catalogs_not_leaked() {
         // the information schema used to introduce cyclic Arcs
-        let ctx = SessionContext::with_config(
+        let ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -2661,7 +2403,7 @@ mod tests {
     #[tokio::test]
     async fn sql_create_schema() -> Result<()> {
         // the information schema used to introduce cyclic Arcs
-        let ctx = SessionContext::with_config(
+        let ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -2684,7 +2426,7 @@ mod tests {
     #[tokio::test]
     async fn sql_create_catalog() -> Result<()> {
         // the information schema used to introduce cyclic Arcs
-        let ctx = SessionContext::with_config(
+        let ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -2704,60 +2446,6 @@ mod tests {
         let results = ctx.sql("SELECT * FROM information_schema.tables WHERE table_catalog='test' AND table_schema='abc' AND table_name = 'y'").await.unwrap().collect().await.unwrap();
 
         assert_eq!(results[0].num_rows(), 1);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_with_glob_path() -> Result<()> {
-        let ctx = SessionContext::new();
-
-        let df = ctx
-            .read_parquet(
-                format!("{}/alltypes_plain*.parquet", parquet_test_data()),
-                ParquetReadOptions::default(),
-            )
-            .await?;
-        let results = df.collect().await?;
-        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
-        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
-        assert_eq!(total_rows, 10);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_with_glob_path_issue_2465() -> Result<()> {
-        let ctx = SessionContext::new();
-
-        let df = ctx
-            .read_parquet(
-                // it was reported that when a path contains // (two consecutive separator) no files were found
-                // in this test, regardless of parquet_test_data() value, our path now contains a //
-                format!("{}/..//*/alltypes_plain*.parquet", parquet_test_data()),
-                ParquetReadOptions::default(),
-            )
-            .await?;
-        let results = df.collect().await?;
-        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
-        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
-        assert_eq!(total_rows, 10);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn read_from_registered_table_with_glob_path() -> Result<()> {
-        let ctx = SessionContext::new();
-
-        ctx.register_parquet(
-            "test",
-            &format!("{}/alltypes_plain*.parquet", parquet_test_data()),
-            ParquetReadOptions::default(),
-        )
-        .await?;
-        let df = ctx.sql("SELECT * FROM test").await?;
-        let results = df.collect().await?;
-        let total_rows: usize = results.iter().map(|rb| rb.num_rows()).sum();
-        // alltypes_plain.parquet = 8 rows, alltypes_plain.snappy.parquet = 2 rows, alltypes_dictionary.parquet = 2 rows
-        assert_eq!(total_rows, 10);
         Ok(())
     }
 
@@ -2800,50 +2488,14 @@ mod tests {
         }
     }
 
-    /// Execute SQL and return results
-    async fn plan_and_collect(
-        ctx: &SessionContext,
-        sql: &str,
-    ) -> Result<Vec<RecordBatch>> {
-        ctx.sql(sql).await?.collect().await
-    }
-
-    /// Generate CSV partitions within the supplied directory
-    fn populate_csv_partitions(
-        tmp_dir: &TempDir,
-        partition_count: usize,
-        file_extension: &str,
-    ) -> Result<SchemaRef> {
-        // define schema for data source (csv file)
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("c1", DataType::UInt32, false),
-            Field::new("c2", DataType::UInt64, false),
-            Field::new("c3", DataType::Boolean, false),
-        ]));
-
-        // generate a partitioned file
-        for partition in 0..partition_count {
-            let filename = format!("partition-{partition}.{file_extension}");
-            let file_path = tmp_dir.path().join(filename);
-            let mut file = File::create(file_path)?;
-
-            // generate some data
-            for i in 0..=10 {
-                let data = format!("{},{},{}\n", partition, i, i % 2 == 0);
-                file.write_all(data.as_bytes())?;
-            }
-        }
-
-        Ok(schema)
-    }
-
     /// Generate a partitioned CSV file and register it with an execution context
     async fn create_ctx(
         tmp_dir: &TempDir,
         partition_count: usize,
     ) -> Result<SessionContext> {
-        let ctx =
-            SessionContext::with_config(SessionConfig::new().with_target_partitions(8));
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(8),
+        );
 
         let schema = populate_csv_partitions(tmp_dir, partition_count, ".csv")?;
 
@@ -2856,38 +2508,5 @@ mod tests {
         .await?;
 
         Ok(ctx)
-    }
-
-    // Test for compilation error when calling read_* functions from an #[async_trait] function.
-    // See https://github.com/apache/arrow-datafusion/issues/1154
-    #[async_trait]
-    trait CallReadTrait {
-        async fn call_read_csv(&self) -> DataFrame;
-        async fn call_read_avro(&self) -> DataFrame;
-        async fn call_read_parquet(&self) -> DataFrame;
-    }
-
-    struct CallRead {}
-
-    #[async_trait]
-    impl CallReadTrait for CallRead {
-        async fn call_read_csv(&self) -> DataFrame {
-            let ctx = SessionContext::new();
-            ctx.read_csv("dummy", CsvReadOptions::new()).await.unwrap()
-        }
-
-        async fn call_read_avro(&self) -> DataFrame {
-            let ctx = SessionContext::new();
-            ctx.read_avro("dummy", AvroReadOptions::default())
-                .await
-                .unwrap()
-        }
-
-        async fn call_read_parquet(&self) -> DataFrame {
-            let ctx = SessionContext::new();
-            ctx.read_parquet("dummy", ParquetReadOptions::default())
-                .await
-                .unwrap()
-        }
     }
 }

@@ -19,18 +19,27 @@
 //! It will do in-memory sorting if it has enough memory budget
 //! but spills to disk if needed.
 
+use std::any::Any;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use crate::common::{spawn_buffered, IPCWriter};
 use crate::expressions::PhysicalSortExpr;
 use crate::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
-use crate::sorts::merge::streaming_merge;
+use crate::sorts::streaming_merge::streaming_merge;
 use crate::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
+use crate::topk::TopK;
 use crate::{
     DisplayAs, DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan,
     Partitioning, SendableRecordBatchStream, Statistics,
 };
-pub use arrow::compute::SortOptions;
+
 use arrow::compute::{concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::FileReader;
@@ -43,15 +52,9 @@ use datafusion_execution::memory_pool::{
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
+
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, error, trace};
-use std::any::Any;
-use std::fmt;
-use std::fmt::{Debug, Formatter};
-use std::fs::File;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tokio::task;
 
@@ -732,7 +735,13 @@ impl SortExec {
         self
     }
 
-    /// Whether this `SortExec` preserves partitioning of the children
+    /// Modify how many rows to include in the result
+    ///
+    /// If None, then all rows will be returned, in sorted order.
+    /// If Some, then only the top `fetch` rows will be returned.
+    /// This can reduce the memory pressure required by the sort
+    /// operation since rows that are not going to be included
+    /// can be dropped.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
@@ -762,12 +771,12 @@ impl DisplayAs for SortExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let expr: Vec<String> = self.expr.iter().map(|e| e.to_string()).collect();
+                let expr = PhysicalSortExpr::format_list(&self.expr);
                 match self.fetch {
                     Some(fetch) => {
-                        write!(f, "SortExec: fetch={fetch}, expr=[{}]", expr.join(","))
+                        write!(f, "SortExec: TopK(fetch={fetch}), expr=[{expr}]",)
                     }
-                    None => write!(f, "SortExec: expr=[{}]", expr.join(",")),
+                    None => write!(f, "SortExec: expr=[{expr}]"),
                 }
             }
         }
@@ -826,7 +835,10 @@ impl ExecutionPlan for SortExec {
     }
 
     fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input.equivalence_properties()
+        // Reset the ordering equivalence class with the new ordering:
+        self.input
+            .equivalence_properties()
+            .with_reorder(self.expr.to_vec())
     }
 
     fn with_new_children(
@@ -853,42 +865,69 @@ impl ExecutionPlan for SortExec {
 
         trace!("End SortExec's input.execute for partition: {}", partition);
 
-        let mut sorter = ExternalSorter::new(
-            partition,
-            input.schema(),
-            self.expr.clone(),
-            context.session_config().batch_size(),
-            self.fetch,
-            execution_options.sort_spill_reservation_bytes,
-            execution_options.sort_in_place_threshold_bytes,
-            &self.metrics_set,
-            context.runtime_env(),
-        );
+        if let Some(fetch) = self.fetch.as_ref() {
+            let mut topk = TopK::try_new(
+                partition,
+                input.schema(),
+                self.expr.clone(),
+                *fetch,
+                context.session_config().batch_size(),
+                context.runtime_env(),
+                &self.metrics_set,
+                partition,
+            )?;
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
-            futures::stream::once(async move {
-                while let Some(batch) = input.next().await {
-                    let batch = batch?;
-                    sorter.insert_batch(batch).await?;
-                }
-                sorter.sort()
-            })
-            .try_flatten(),
-        )))
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                futures::stream::once(async move {
+                    while let Some(batch) = input.next().await {
+                        let batch = batch?;
+                        topk.insert_batch(batch)?;
+                    }
+                    topk.emit()
+                })
+                .try_flatten(),
+            )))
+        } else {
+            let mut sorter = ExternalSorter::new(
+                partition,
+                input.schema(),
+                self.expr.clone(),
+                context.session_config().batch_size(),
+                self.fetch,
+                execution_options.sort_spill_reservation_bytes,
+                execution_options.sort_in_place_threshold_bytes,
+                &self.metrics_set,
+                context.runtime_env(),
+            );
+
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                futures::stream::once(async move {
+                    while let Some(batch) = input.next().await {
+                        let batch = batch?;
+                        sorter.insert_batch(batch).await?;
+                    }
+                    sorter.sort()
+                })
+                .try_flatten(),
+            )))
+        }
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics_set.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         self.input.statistics()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::coalesce_partitions::CoalescePartitionsExec;
     use crate::collect;
@@ -897,14 +936,15 @@ mod tests {
     use crate::test;
     use crate::test::assert_is_pending;
     use crate::test::exec::{assert_strong_count_converges_to_zero, BlockingExec};
+
     use arrow::array::*;
     use arrow::compute::SortOptions;
     use arrow::datatypes::*;
     use datafusion_common::cast::as_primitive_array;
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeConfig;
+
     use futures::FutureExt;
-    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_in_mem_sort() -> Result<()> {
@@ -1043,7 +1083,7 @@ mod tests {
             assert_eq!(result.len(), 1);
 
             let metrics = sort_exec.metrics().unwrap();
-            let did_it_spill = metrics.spill_count().unwrap() > 0;
+            let did_it_spill = metrics.spill_count().unwrap_or(0) > 0;
             assert_eq!(did_it_spill, expect_spillage, "with fetch: {fetch:?}");
         }
         Ok(())

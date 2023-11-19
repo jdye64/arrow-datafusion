@@ -46,9 +46,9 @@ pub use pool::*;
 ///
 /// The following memory pool implementations are available:
 ///
-/// * [`UnboundedMemoryPool`](pool::UnboundedMemoryPool)
-/// * [`GreedyMemoryPool`](pool::GreedyMemoryPool)
-/// * [`FairSpillPool`](pool::FairSpillPool)
+/// * [`UnboundedMemoryPool`]
+/// * [`GreedyMemoryPool`]
+/// * [`FairSpillPool`]
 pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     /// Registers a new [`MemoryConsumer`]
     ///
@@ -157,6 +157,11 @@ impl MemoryReservation {
         self.size
     }
 
+    /// Returns [MemoryConsumer] for this [MemoryReservation]
+    pub fn consumer(&self) -> &MemoryConsumer {
+        &self.registration.consumer
+    }
+
     /// Frees all bytes from this reservation back to the underlying
     /// pool, returning the number of bytes freed.
     pub fn free(&mut self) -> usize {
@@ -230,7 +235,7 @@ impl MemoryReservation {
         }
     }
 
-    /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]
+    /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]
     pub fn new_empty(&self) -> Self {
         Self {
             size: 0,

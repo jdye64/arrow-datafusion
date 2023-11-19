@@ -18,6 +18,12 @@
 //! [`FileScanConfig`] to configure scanning of possibly partitioned
 //! file sources.
 
+use std::{
+    borrow::Cow, cmp::min, collections::HashMap, fmt::Debug, marker::PhantomData,
+    sync::Arc, vec,
+};
+
+use super::get_projected_output_ordering;
 use crate::datasource::{
     listing::{FileRange, PartitionedFile},
     object_store::ObjectStoreUrl,
@@ -30,20 +36,14 @@ use crate::{
 use arrow::array::{ArrayData, BufferBuilder};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{ArrowNativeType, UInt16Type};
-use arrow_array::{ArrayRef, DictionaryArray, RecordBatch};
+use arrow_array::{ArrayRef, DictionaryArray, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::exec_err;
-use datafusion_common::{ColumnStatistics, Statistics};
+use datafusion_common::stats::Precision;
+use datafusion_common::{exec_err, ColumnStatistics, Statistics};
 use datafusion_physical_expr::LexOrdering;
 
 use itertools::Itertools;
 use log::warn;
-use std::{
-    borrow::Cow, cmp::min, collections::HashMap, fmt::Debug, marker::PhantomData,
-    sync::Arc, vec,
-};
-
-use super::get_projected_output_ordering;
 
 /// Convert type to a type suitable for use as a [`ListingTable`]
 /// partition column. Returns `Dictionary(UInt16, val_type)`, which is
@@ -101,7 +101,7 @@ pub struct FileScanConfig {
     /// all records after filtering are returned.
     pub limit: Option<usize>,
     /// The partitioning columns
-    pub table_partition_cols: Vec<(String, DataType)>,
+    pub table_partition_cols: Vec<Field>,
     /// All equivalent lexicographical orderings that describe the schema.
     pub output_ordering: Vec<LexOrdering>,
     /// Indicates whether this plan may produce an infinite stream of records.
@@ -130,30 +130,22 @@ impl FileScanConfig {
         let mut table_cols_stats = vec![];
         for idx in proj_iter {
             if idx < self.file_schema.fields().len() {
-                table_fields.push(self.file_schema.field(idx).clone());
-                if let Some(file_cols_stats) = &self.statistics.column_statistics {
-                    table_cols_stats.push(file_cols_stats[idx].clone())
-                } else {
-                    table_cols_stats.push(ColumnStatistics::default())
-                }
+                let field = self.file_schema.field(idx);
+                table_fields.push(field.clone());
+                table_cols_stats.push(self.statistics.column_statistics[idx].clone())
             } else {
                 let partition_idx = idx - self.file_schema.fields().len();
-                table_fields.push(Field::new(
-                    &self.table_partition_cols[partition_idx].0,
-                    self.table_partition_cols[partition_idx].1.to_owned(),
-                    false,
-                ));
+                table_fields.push(self.table_partition_cols[partition_idx].to_owned());
                 // TODO provide accurate stat for partition column (#1186)
-                table_cols_stats.push(ColumnStatistics::default())
+                table_cols_stats.push(ColumnStatistics::new_unknown())
             }
         }
 
         let table_stats = Statistics {
-            num_rows: self.statistics.num_rows,
-            is_exact: self.statistics.is_exact,
+            num_rows: self.statistics.num_rows.clone(),
             // TODO correct byte size?
-            total_byte_size: None,
-            column_statistics: Some(table_cols_stats),
+            total_byte_size: Precision::Absent,
+            column_statistics: table_cols_stats,
         };
 
         let table_schema = Arc::new(
@@ -344,10 +336,16 @@ impl PartitionColumnProjector {
                     &mut self.key_buffer_cache,
                     partition_value.as_ref(),
                     file_batch.num_rows(),
-                ),
+                )?,
             )
         }
-        RecordBatch::try_new(Arc::clone(&self.projected_schema), cols).map_err(Into::into)
+
+        RecordBatch::try_new_with_options(
+            Arc::clone(&self.projected_schema),
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(file_batch.num_rows())),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -398,11 +396,11 @@ fn create_dict_array<T>(
     dict_val: &ScalarValue,
     len: usize,
     data_type: DataType,
-) -> ArrayRef
+) -> Result<ArrayRef>
 where
     T: ArrowNativeType,
 {
-    let dict_vals = dict_val.to_array();
+    let dict_vals = dict_val.to_array()?;
 
     let sliced_key_buffer = buffer_gen.get_buffer(len);
 
@@ -411,16 +409,16 @@ where
         .len(len)
         .add_buffer(sliced_key_buffer);
     builder = builder.add_child_data(dict_vals.to_data());
-    Arc::new(DictionaryArray::<UInt16Type>::from(
+    Ok(Arc::new(DictionaryArray::<UInt16Type>::from(
         builder.build().unwrap(),
-    ))
+    )))
 }
 
 fn create_output_array(
     key_buffer_cache: &mut ZeroBufferGenerators,
     val: &ScalarValue,
     len: usize,
-) -> ArrayRef {
+) -> Result<ArrayRef> {
     if let ScalarValue::Dictionary(key_type, dict_val) = &val {
         match key_type.as_ref() {
             DataType::Int8 => {
@@ -507,11 +505,11 @@ mod tests {
         let conf = config_for_projection(
             Arc::clone(&file_schema),
             None,
-            Statistics::default(),
-            vec![(
+            Statistics::new_unknown(&file_schema),
+            to_partition_cols(vec![(
                 "date".to_owned(),
                 wrap_partition_type_in_dict(DataType::Utf8),
-            )],
+            )]),
         );
 
         let (proj_schema, proj_statistics, _) = conf.project();
@@ -522,10 +520,7 @@ mod tests {
             "partition columns are the last columns"
         );
         assert_eq!(
-            proj_statistics
-                .column_statistics
-                .expect("projection creates column statistics")
-                .len(),
+            proj_statistics.column_statistics.len(),
             file_schema.fields().len() + 1
         );
         // TODO implement tests for partition column statistics once implemented
@@ -538,29 +533,56 @@ mod tests {
     }
 
     #[test]
+    fn physical_plan_config_no_projection_tab_cols_as_field() {
+        let file_schema = aggr_test_schema();
+
+        // make a table_partition_col as a field
+        let table_partition_col =
+            Field::new("date", wrap_partition_type_in_dict(DataType::Utf8), true)
+                .with_metadata(HashMap::from_iter(vec![(
+                    "key_whatever".to_owned(),
+                    "value_whatever".to_owned(),
+                )]));
+
+        let conf = config_for_projection(
+            Arc::clone(&file_schema),
+            None,
+            Statistics::new_unknown(&file_schema),
+            vec![table_partition_col.clone()],
+        );
+
+        // verify the proj_schema inlcudes the last column and exactly the same the field it is defined
+        let (proj_schema, _proj_statistics, _) = conf.project();
+        assert_eq!(proj_schema.fields().len(), file_schema.fields().len() + 1);
+        assert_eq!(
+            *proj_schema.field(file_schema.fields().len()),
+            table_partition_col,
+            "partition columns are the last columns and ust have all values defined in created field"
+        );
+    }
+
+    #[test]
     fn physical_plan_config_with_projection() {
         let file_schema = aggr_test_schema();
         let conf = config_for_projection(
             Arc::clone(&file_schema),
             Some(vec![file_schema.fields().len(), 0]),
             Statistics {
-                num_rows: Some(10),
+                num_rows: Precision::Inexact(10),
                 // assign the column index to distinct_count to help assert
                 // the source statistic after the projection
-                column_statistics: Some(
-                    (0..file_schema.fields().len())
-                        .map(|i| ColumnStatistics {
-                            distinct_count: Some(i),
-                            ..Default::default()
-                        })
-                        .collect(),
-                ),
-                ..Default::default()
+                column_statistics: (0..file_schema.fields().len())
+                    .map(|i| ColumnStatistics {
+                        distinct_count: Precision::Inexact(i),
+                        ..Default::default()
+                    })
+                    .collect(),
+                total_byte_size: Precision::Absent,
             },
-            vec![(
+            to_partition_cols(vec![(
                 "date".to_owned(),
                 wrap_partition_type_in_dict(DataType::Utf8),
-            )],
+            )]),
         );
 
         let (proj_schema, proj_statistics, _) = conf.project();
@@ -568,13 +590,11 @@ mod tests {
             columns(&proj_schema),
             vec!["date".to_owned(), "c1".to_owned()]
         );
-        let proj_stat_cols = proj_statistics
-            .column_statistics
-            .expect("projection creates column statistics");
+        let proj_stat_cols = proj_statistics.column_statistics;
         assert_eq!(proj_stat_cols.len(), 2);
         // TODO implement tests for proj_stat_cols[0] once partition column
         // statistics are implemented
-        assert_eq!(proj_stat_cols[1].distinct_count, Some(0));
+        assert_eq!(proj_stat_cols[1].distinct_count, Precision::Inexact(0));
 
         let col_names = conf.projected_file_column_names();
         assert_eq!(col_names, Some(vec!["c1".to_owned()]));
@@ -615,8 +635,8 @@ mod tests {
                 file_batch.schema().fields().len(),
                 file_batch.schema().fields().len() + 2,
             ]),
-            Statistics::default(),
-            partition_cols.clone(),
+            Statistics::new_unknown(&file_batch.schema()),
+            to_partition_cols(partition_cols.clone()),
         );
         let (proj_schema, ..) = conf.project();
         // created a projector for that projected schema
@@ -761,7 +781,7 @@ mod tests {
         file_schema: SchemaRef,
         projection: Option<Vec<usize>>,
         statistics: Statistics,
-        table_partition_cols: Vec<(String, DataType)>,
+        table_partition_cols: Vec<Field>,
     ) -> FileScanConfig {
         FileScanConfig {
             file_schema,
@@ -774,6 +794,14 @@ mod tests {
             output_ordering: vec![],
             infinite_source: false,
         }
+    }
+
+    /// Convert partition columns from Vec<String DataType> to Vec<Field>
+    fn to_partition_cols(table_partition_cols: Vec<(String, DataType)>) -> Vec<Field> {
+        table_partition_cols
+            .iter()
+            .map(|(name, dtype)| Field::new(name, dtype.clone(), false))
+            .collect::<Vec<_>>()
     }
 
     /// returns record batch with 3 columns of i32 in memory

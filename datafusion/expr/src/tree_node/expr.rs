@@ -22,9 +22,10 @@ use crate::expr::{
     GetIndexedField, GroupingSet, InList, InSubquery, Like, Placeholder, ScalarFunction,
     ScalarUDF, Sort, TryCast, WindowFunction,
 };
-use crate::Expr;
-use datafusion_common::tree_node::VisitRecursion;
-use datafusion_common::{tree_node::TreeNode, Result};
+use crate::{Expr, GetFieldAccess};
+
+use datafusion_common::tree_node::{TreeNode, VisitRecursion};
+use datafusion_common::Result;
 
 impl TreeNode for Expr {
     fn apply_children<F>(&self, op: &mut F) -> Result<VisitRecursion>
@@ -47,8 +48,19 @@ impl TreeNode for Expr {
             | Expr::TryCast(TryCast { expr, .. })
             | Expr::Sort(Sort { expr, .. })
             | Expr::InSubquery(InSubquery{ expr, .. }) => vec![expr.as_ref().clone()],
-            Expr::GetIndexedField(GetIndexedField { expr, .. }) => {
-                vec![expr.as_ref().clone()]
+            Expr::GetIndexedField(GetIndexedField { expr, field }) => {
+                let expr = expr.as_ref().clone();
+                match field {
+                    GetFieldAccess::ListIndex {key} => {
+                        vec![key.as_ref().clone(), expr]
+                    },
+                    GetFieldAccess::ListRange {start, stop} => {
+                        vec![start.as_ref().clone(), stop.as_ref().clone(), expr]
+                    }
+                    GetFieldAccess::NamedStructField {name: _name} => {
+                        vec![expr]
+                    }
+                }
             }
             Expr::GroupingSet(GroupingSet::Rollup(exprs))
             | Expr::GroupingSet(GroupingSet::Cube(exprs)) => exprs.clone(),
@@ -65,8 +77,7 @@ impl TreeNode for Expr {
             | Expr::Literal(_)
             | Expr::Exists { .. }
             | Expr::ScalarSubquery(_)
-            | Expr::Wildcard
-            | Expr::QualifiedWildcard { .. }
+            | Expr::Wildcard {..}
             | Expr::Placeholder (_) => vec![],
             Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
                 vec![left.as_ref().clone(), right.as_ref().clone()]
@@ -146,9 +157,11 @@ impl TreeNode for Expr {
         let mut transform = transform;
 
         Ok(match self {
-            Expr::Alias(Alias { expr, name, .. }) => {
-                Expr::Alias(Alias::new(transform(*expr)?, name))
-            }
+            Expr::Alias(Alias {
+                expr,
+                relation,
+                name,
+            }) => Expr::Alias(Alias::new(transform(*expr)?, relation, name)),
             Expr::Column(_) => self,
             Expr::OuterReferenceColumn(_, _) => self,
             Expr::Exists { .. } => self,
@@ -338,10 +351,7 @@ impl TreeNode for Expr {
                 transform_vec(list, &mut transform)?,
                 negated,
             )),
-            Expr::Wildcard => Expr::Wildcard,
-            Expr::QualifiedWildcard { qualifier } => {
-                Expr::QualifiedWildcard { qualifier }
-            }
+            Expr::Wildcard { qualifier } => Expr::Wildcard { qualifier },
             Expr::GetIndexedField(GetIndexedField { expr, field }) => {
                 Expr::GetIndexedField(GetIndexedField::new(
                     transform_boxed(expr, &mut transform)?,

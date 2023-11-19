@@ -20,37 +20,36 @@
 mod arrow_file;
 mod avro;
 mod csv;
+mod file_scan_config;
 mod file_stream;
 mod json;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 
 pub(crate) use self::csv::plan_to_csv;
 pub use self::csv::{CsvConfig, CsvExec, CsvOpener};
-pub(crate) use self::parquet::plan_to_parquet;
+pub(crate) use self::json::plan_to_json;
+#[cfg(feature = "parquet")]
 pub use self::parquet::{ParquetExec, ParquetFileMetrics, ParquetFileReaderFactory};
-use arrow::{
-    array::new_null_array,
-    compute::can_cast_types,
-    datatypes::{DataType, Schema, SchemaRef},
-    record_batch::{RecordBatch, RecordBatchOptions},
-};
+
 pub use arrow_file::ArrowExec;
 pub use avro::AvroExec;
-use datafusion_physical_expr::PhysicalSortExpr;
-pub use file_stream::{FileOpenFuture, FileOpener, FileStream, OnError};
-pub(crate) use json::plan_to_json;
-pub use json::{JsonOpener, NdJsonExec};
-mod file_scan_config;
-pub(crate) use file_scan_config::PartitionColumnProjector;
+use file_scan_config::PartitionColumnProjector;
 pub use file_scan_config::{
     wrap_partition_type_in_dict, wrap_partition_value_in_dict, FileScanConfig,
 };
+pub use file_stream::{FileOpenFuture, FileOpener, FileStream, OnError};
+pub use json::{JsonOpener, NdJsonExec};
 
-use crate::error::{DataFusionError, Result};
-use crate::{
-    datasource::file_format::write::FileWriterMode,
-    physical_plan::{DisplayAs, DisplayFormatType},
+use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    sync::Arc,
+    vec,
 };
+
+use super::listing::ListingTableUrl;
+use crate::error::{DataFusionError, Result};
+use crate::physical_plan::{DisplayAs, DisplayFormatType};
 use crate::{
     datasource::{
         listing::{FileRange, PartitionedFile},
@@ -59,21 +58,20 @@ use crate::{
     physical_plan::display::{OutputOrderingDisplay, ProjectSchemaDisplay},
 };
 
+use arrow::{
+    array::new_null_array,
+    compute::{can_cast_types, cast},
+    datatypes::{DataType, Schema, SchemaRef},
+    record_batch::{RecordBatch, RecordBatchOptions},
+};
 use datafusion_common::{file_options::FileTypeWriterOptions, plan_err};
 use datafusion_physical_expr::expressions::Column;
-
-use arrow::compute::cast;
+use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_plan::ExecutionPlan;
+
 use log::debug;
 use object_store::path::Path;
 use object_store::ObjectMeta;
-use std::{
-    fmt::{Debug, Formatter, Result as FmtResult},
-    sync::Arc,
-    vec,
-};
-
-use super::listing::ListingTableUrl;
 
 /// The base configurations to provide when creating a physical plan for
 /// writing to any given file format.
@@ -89,8 +87,6 @@ pub struct FileSinkConfig {
     /// A vector of column names and their corresponding data types,
     /// representing the partitioning columns for the file
     pub table_partition_cols: Vec<(String, DataType)>,
-    /// A writer mode that determines how data is written to the file
-    pub writer_mode: FileWriterMode,
     /// If true, it is assumed there is a single table_path which is a file to which all data should be written
     /// regardless of input partitioning. Otherwise, each table path is assumed to be a directory
     /// to which each output partition is written to its own output file.
@@ -526,6 +522,7 @@ mod tests {
     };
     use arrow_schema::Field;
     use chrono::Utc;
+    use datafusion_common::config::ConfigOptions;
 
     use crate::physical_plan::{DefaultDisplay, VerboseDisplay};
 
@@ -787,6 +784,7 @@ mod tests {
             last_modified: Utc::now(),
             size: 42,
             e_tag: None,
+            version: None,
         };
 
         PartitionedFile {
@@ -798,6 +796,7 @@ mod tests {
     }
 
     /// Unit tests for `repartition_file_groups()`
+    #[cfg(feature = "parquet")]
     mod repartition_file_groups_test {
         use datafusion_common::Statistics;
         use itertools::Itertools;
@@ -815,7 +814,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: file_group,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -826,11 +825,7 @@ mod tests {
                 None,
             );
 
-            let partitioned_file = parquet_exec
-                .get_repartitioned(4, 0)
-                .base_config()
-                .file_groups
-                .clone();
+            let partitioned_file = repartition_with_size(&parquet_exec, 4, 0);
 
             assert!(partitioned_file[0][0].range.is_none());
         }
@@ -878,7 +873,9 @@ mod tests {
                             object_store_url: ObjectStoreUrl::local_filesystem(),
                             file_groups: fg.clone(),
                             file_schema: Arc::new(Schema::empty()),
-                            statistics: Statistics::default(),
+                            statistics: Statistics::new_unknown(&Arc::new(
+                                Schema::empty(),
+                            )),
                             projection: None,
                             limit: None,
                             table_partition_cols: vec![],
@@ -889,13 +886,8 @@ mod tests {
                         None,
                     );
 
-                    let actual = file_groups_to_vec(
-                        parquet_exec
-                            .get_repartitioned(n_partition, 10)
-                            .base_config()
-                            .file_groups
-                            .clone(),
-                    );
+                    let actual =
+                        repartition_with_size_to_vec(&parquet_exec, n_partition, 10);
 
                     assert_eq!(expected, &actual);
                 }
@@ -912,7 +904,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: single_partition,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -923,13 +915,7 @@ mod tests {
                 None,
             );
 
-            let actual = file_groups_to_vec(
-                parquet_exec
-                    .get_repartitioned(4, 10)
-                    .base_config()
-                    .file_groups
-                    .clone(),
-            );
+            let actual = repartition_with_size_to_vec(&parquet_exec, 4, 10);
             let expected = vec![
                 (0, "a".to_string(), 0, 31),
                 (1, "a".to_string(), 31, 62),
@@ -949,7 +935,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: single_partition,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -960,13 +946,7 @@ mod tests {
                 None,
             );
 
-            let actual = file_groups_to_vec(
-                parquet_exec
-                    .get_repartitioned(96, 5)
-                    .base_config()
-                    .file_groups
-                    .clone(),
-            );
+            let actual = repartition_with_size_to_vec(&parquet_exec, 96, 5);
             let expected = vec![
                 (0, "a".to_string(), 0, 1),
                 (1, "a".to_string(), 1, 2),
@@ -992,7 +972,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: source_partitions,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -1003,13 +983,7 @@ mod tests {
                 None,
             );
 
-            let actual = file_groups_to_vec(
-                parquet_exec
-                    .get_repartitioned(3, 10)
-                    .base_config()
-                    .file_groups
-                    .clone(),
-            );
+            let actual = repartition_with_size_to_vec(&parquet_exec, 3, 10);
             let expected = vec![
                 (0, "a".to_string(), 0, 34),
                 (1, "a".to_string(), 34, 40),
@@ -1031,7 +1005,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: source_partitions,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -1042,13 +1016,7 @@ mod tests {
                 None,
             );
 
-            let actual = file_groups_to_vec(
-                parquet_exec
-                    .get_repartitioned(2, 10)
-                    .base_config()
-                    .file_groups
-                    .clone(),
-            );
+            let actual = repartition_with_size_to_vec(&parquet_exec, 2, 10);
             let expected = vec![
                 (0, "a".to_string(), 0, 40),
                 (0, "b".to_string(), 0, 10),
@@ -1071,7 +1039,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: source_partitions,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -1082,11 +1050,7 @@ mod tests {
                 None,
             );
 
-            let actual = parquet_exec
-                .get_repartitioned(65, 10)
-                .base_config()
-                .file_groups
-                .clone();
+            let actual = repartition_with_size(&parquet_exec, 65, 10);
             assert_eq!(2, actual.len());
         }
 
@@ -1100,7 +1064,7 @@ mod tests {
                     object_store_url: ObjectStoreUrl::local_filesystem(),
                     file_groups: single_partition,
                     file_schema: Arc::new(Schema::empty()),
-                    statistics: Statistics::default(),
+                    statistics: Statistics::new_unknown(&Schema::empty()),
                     projection: None,
                     limit: None,
                     table_partition_cols: vec![],
@@ -1111,17 +1075,47 @@ mod tests {
                 None,
             );
 
-            let actual = parquet_exec
-                .get_repartitioned(65, 500)
-                .base_config()
-                .file_groups
-                .clone();
+            let actual = repartition_with_size(&parquet_exec, 65, 500);
             assert_eq!(1, actual.len());
         }
 
-        fn file_groups_to_vec(
-            file_groups: Vec<Vec<PartitionedFile>>,
+        /// Calls `ParquetExec.repartitioned` with the  specified
+        /// `target_partitions` and `repartition_file_min_size`, returning the
+        /// resulting `PartitionedFile`s
+        fn repartition_with_size(
+            parquet_exec: &ParquetExec,
+            target_partitions: usize,
+            repartition_file_min_size: usize,
+        ) -> Vec<Vec<PartitionedFile>> {
+            let mut config = ConfigOptions::new();
+            config.optimizer.repartition_file_min_size = repartition_file_min_size;
+
+            parquet_exec
+                .repartitioned(target_partitions, &config)
+                .unwrap() // unwrap Result
+                .unwrap() // unwrap Option
+                .as_any()
+                .downcast_ref::<ParquetExec>()
+                .unwrap()
+                .base_config()
+                .file_groups
+                .clone()
+        }
+
+        /// Calls `repartition_with_size` and returns a tuple for each output `PartitionedFile`:
+        ///
+        /// `(partition index, file path, start, end)`
+        fn repartition_with_size_to_vec(
+            parquet_exec: &ParquetExec,
+            target_partitions: usize,
+            repartition_file_min_size: usize,
         ) -> Vec<(usize, String, i64, i64)> {
+            let file_groups = repartition_with_size(
+                parquet_exec,
+                target_partitions,
+                repartition_file_min_size,
+            );
+
             file_groups
                 .iter()
                 .enumerate()

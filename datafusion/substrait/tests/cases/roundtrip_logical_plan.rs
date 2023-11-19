@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::arrow::array::ArrayRef;
+use datafusion::physical_plan::Accumulator;
+use datafusion::scalar::ScalarValue;
 use datafusion_substrait::logical_plan::{
     consumer::from_substrait_plan, producer::to_substrait_plan,
 };
@@ -23,15 +26,20 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::common::{DFSchema, DFSchemaRef};
-use datafusion::error::Result;
+use datafusion::common::{not_impl_err, plan_err, DFSchema, DFSchemaRef};
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::SerializerRegistry;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
+use datafusion::logical_expr::{
+    Extension, LogicalPlan, UserDefinedLogicalNode, Volatility,
+};
 use datafusion::optimizer::simplify_expressions::expr_simplifier::THRESHOLD_INLINE_INLIST;
 use datafusion::prelude::*;
+
 use substrait::proto::extensions::simple_extension_declaration::MappingType;
+use substrait::proto::rel::RelType;
+use substrait::proto::{plan_rel, Plan, Rel};
 
 struct MockSerializerRegistry;
 
@@ -312,6 +320,16 @@ async fn simple_scalar_function_substr() -> Result<()> {
 }
 
 #[tokio::test]
+async fn simple_scalar_function_is_null() -> Result<()> {
+    roundtrip("SELECT * FROM data WHERE a IS NULL").await
+}
+
+#[tokio::test]
+async fn simple_scalar_function_is_not_null() -> Result<()> {
+    roundtrip("SELECT * FROM data WHERE a IS NOT NULL").await
+}
+
+#[tokio::test]
 async fn case_without_base_expression() -> Result<()> {
     roundtrip("SELECT (CASE WHEN a >= 0 THEN 'positive' ELSE 'negative' END) FROM data")
         .await
@@ -383,12 +401,15 @@ async fn roundtrip_inner_join() -> Result<()> {
 
 #[tokio::test]
 async fn roundtrip_non_equi_inner_join() -> Result<()> {
-    roundtrip("SELECT data.a FROM data JOIN data2 ON data.a <> data2.a").await
+    roundtrip_verify_post_join_filter(
+        "SELECT data.a FROM data JOIN data2 ON data.a <> data2.a",
+    )
+    .await
 }
 
 #[tokio::test]
 async fn roundtrip_non_equi_join() -> Result<()> {
-    roundtrip(
+    roundtrip_verify_post_join_filter(
         "SELECT data.a FROM data, data2 WHERE data.a = data2.a AND data.e > data2.a",
     )
     .await
@@ -600,7 +621,7 @@ async fn new_test_grammar() -> Result<()> {
 
 #[tokio::test]
 async fn extension_logical_plan() -> Result<()> {
-    let mut ctx = create_context().await?;
+    let ctx = create_context().await?;
     let validation_bytes = "MockUserDefinedLogicalPlan".as_bytes().to_vec();
     let ext_plan = LogicalPlan::Extension(Extension {
         node: Arc::new(MockUserDefinedLogicalPlan {
@@ -611,7 +632,7 @@ async fn extension_logical_plan() -> Result<()> {
     });
 
     let proto = to_substrait_plan(&ext_plan, &ctx)?;
-    let plan2 = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
 
     let plan1str = format!("{ext_plan:?}");
     let plan2str = format!("{plan2:?}");
@@ -620,12 +641,147 @@ async fn extension_logical_plan() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn roundtrip_aggregate_udf() -> Result<()> {
+    #[derive(Debug)]
+    struct Dummy {}
+
+    impl Accumulator for Dummy {
+        fn state(&self) -> datafusion::error::Result<Vec<ScalarValue>> {
+            Ok(vec![])
+        }
+
+        fn update_batch(
+            &mut self,
+            _values: &[ArrayRef],
+        ) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, _states: &[ArrayRef]) -> datafusion::error::Result<()> {
+            Ok(())
+        }
+
+        fn evaluate(&self) -> datafusion::error::Result<ScalarValue> {
+            Ok(ScalarValue::Float64(None))
+        }
+
+        fn size(&self) -> usize {
+            std::mem::size_of_val(self)
+        }
+    }
+
+    let dummy_agg = create_udaf(
+        // the name; used to represent it in plan descriptions and in the registry, to use in SQL.
+        "dummy_agg",
+        // the input type; DataFusion guarantees that the first entry of `values` in `update` has this type.
+        vec![DataType::Int64],
+        // the return type; DataFusion expects this to match the type returned by `evaluate`.
+        Arc::new(DataType::Int64),
+        Volatility::Immutable,
+        // This is the accumulator factory; DataFusion uses it to create new accumulators.
+        Arc::new(|_| Ok(Box::new(Dummy {}))),
+        // This is the description of the state. `state()` must match the types here.
+        Arc::new(vec![DataType::Float64, DataType::UInt32]),
+    );
+
+    let ctx = create_context().await?;
+    ctx.register_udaf(dummy_agg);
+
+    roundtrip_with_ctx("select dummy_agg(a) from data", ctx).await
+}
+
+fn check_post_join_filters(rel: &Rel) -> Result<()> {
+    // search for target_rel and field value in proto
+    match &rel.rel_type {
+        Some(RelType::Join(join)) => {
+            // check if join filter is None
+            if join.post_join_filter.is_some() {
+                plan_err!(
+                    "DataFusion generated Susbtrait plan cannot have post_join_filter in JoinRel"
+                )
+            } else {
+                // recursively check JoinRels
+                match check_post_join_filters(join.left.as_ref().unwrap().as_ref()) {
+                    Err(e) => Err(e),
+                    Ok(_) => {
+                        check_post_join_filters(join.right.as_ref().unwrap().as_ref())
+                    }
+                }
+            }
+        }
+        Some(RelType::Project(p)) => {
+            check_post_join_filters(p.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::Filter(filter)) => {
+            check_post_join_filters(filter.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::Fetch(fetch)) => {
+            check_post_join_filters(fetch.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::Sort(sort)) => {
+            check_post_join_filters(sort.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::Aggregate(agg)) => {
+            check_post_join_filters(agg.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::Set(set)) => {
+            for input in &set.inputs {
+                match check_post_join_filters(input) {
+                    Err(e) => return Err(e),
+                    Ok(_) => continue,
+                }
+            }
+            Ok(())
+        }
+        Some(RelType::ExtensionSingle(ext)) => {
+            check_post_join_filters(ext.input.as_ref().unwrap().as_ref())
+        }
+        Some(RelType::ExtensionMulti(ext)) => {
+            for input in &ext.inputs {
+                match check_post_join_filters(input) {
+                    Err(e) => return Err(e),
+                    Ok(_) => continue,
+                }
+            }
+            Ok(())
+        }
+        Some(RelType::ExtensionLeaf(_)) | Some(RelType::Read(_)) => Ok(()),
+        _ => not_impl_err!(
+            "Unsupported RelType: {:?} in post join filter check",
+            rel.rel_type
+        ),
+    }
+}
+
+async fn verify_post_join_filter_value(proto: Box<Plan>) -> Result<()> {
+    for relation in &proto.relations {
+        match relation.rel_type.as_ref() {
+            Some(rt) => match rt {
+                plan_rel::RelType::Rel(rel) => match check_post_join_filters(rel) {
+                    Err(e) => return Err(e),
+                    Ok(_) => continue,
+                },
+                plan_rel::RelType::Root(root) => {
+                    match check_post_join_filters(root.input.as_ref().unwrap()) {
+                        Err(e) => return Err(e),
+                        Ok(_) => continue,
+                    }
+                }
+            },
+            None => return plan_err!("Cannot parse plan relation: None"),
+        }
+    }
+
+    Ok(())
+}
+
 async fn assert_expected_plan(sql: &str, expected_plan_str: &str) -> Result<()> {
-    let mut ctx = create_context().await?;
+    let ctx = create_context().await?;
     let df = ctx.sql(sql).await?;
     let plan = df.into_optimized_plan()?;
     let proto = to_substrait_plan(&plan, &ctx)?;
-    let plan2 = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
     let plan2 = ctx.state().optimize(&plan2)?;
     let plan2str = format!("{plan2:?}");
     assert_eq!(expected_plan_str, &plan2str);
@@ -633,11 +789,11 @@ async fn assert_expected_plan(sql: &str, expected_plan_str: &str) -> Result<()> 
 }
 
 async fn roundtrip_fill_na(sql: &str) -> Result<()> {
-    let mut ctx = create_context().await?;
+    let ctx = create_context().await?;
     let df = ctx.sql(sql).await?;
     let plan1 = df.into_optimized_plan()?;
     let proto = to_substrait_plan(&plan1, &ctx)?;
-    let plan2 = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
     let plan2 = ctx.state().optimize(&plan2)?;
 
     // Format plan string and replace all None's with 0
@@ -652,15 +808,15 @@ async fn test_alias(sql_with_alias: &str, sql_no_alias: &str) -> Result<()> {
     // Since we ignore the SubqueryAlias in the producer, the result should be
     // the same as producing a Substrait plan from the same query without aliases
     // sql_with_alias -> substrait -> logical plan = sql_no_alias -> substrait -> logical plan
-    let mut ctx = create_context().await?;
+    let ctx = create_context().await?;
 
     let df_a = ctx.sql(sql_with_alias).await?;
     let proto_a = to_substrait_plan(&df_a.into_optimized_plan()?, &ctx)?;
-    let plan_with_alias = from_substrait_plan(&mut ctx, &proto_a).await?;
+    let plan_with_alias = from_substrait_plan(&ctx, &proto_a).await?;
 
     let df = ctx.sql(sql_no_alias).await?;
     let proto = to_substrait_plan(&df.into_optimized_plan()?, &ctx)?;
-    let plan = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan = from_substrait_plan(&ctx, &proto).await?;
 
     println!("{plan_with_alias:#?}");
     println!("{plan:#?}");
@@ -671,12 +827,11 @@ async fn test_alias(sql_with_alias: &str, sql_no_alias: &str) -> Result<()> {
     Ok(())
 }
 
-async fn roundtrip(sql: &str) -> Result<()> {
-    let mut ctx = create_context().await?;
+async fn roundtrip_with_ctx(sql: &str, ctx: SessionContext) -> Result<()> {
     let df = ctx.sql(sql).await?;
     let plan = df.into_optimized_plan()?;
     let proto = to_substrait_plan(&plan, &ctx)?;
-    let plan2 = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
     let plan2 = ctx.state().optimize(&plan2)?;
 
     println!("{plan:#?}");
@@ -688,12 +843,35 @@ async fn roundtrip(sql: &str) -> Result<()> {
     Ok(())
 }
 
-async fn roundtrip_all_types(sql: &str) -> Result<()> {
-    let mut ctx = create_all_type_context().await?;
+async fn roundtrip(sql: &str) -> Result<()> {
+    roundtrip_with_ctx(sql, create_context().await?).await
+}
+
+async fn roundtrip_verify_post_join_filter(sql: &str) -> Result<()> {
+    let ctx = create_context().await?;
     let df = ctx.sql(sql).await?;
     let plan = df.into_optimized_plan()?;
     let proto = to_substrait_plan(&plan, &ctx)?;
-    let plan2 = from_substrait_plan(&mut ctx, &proto).await?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
+    let plan2 = ctx.state().optimize(&plan2)?;
+
+    println!("{plan:#?}");
+    println!("{plan2:#?}");
+
+    let plan1str = format!("{plan:?}");
+    let plan2str = format!("{plan2:?}");
+    assert_eq!(plan1str, plan2str);
+
+    // verify that the join filters are None
+    verify_post_join_filter_value(proto).await
+}
+
+async fn roundtrip_all_types(sql: &str) -> Result<()> {
+    let ctx = create_all_type_context().await?;
+    let df = ctx.sql(sql).await?;
+    let plan = df.into_optimized_plan()?;
+    let proto = to_substrait_plan(&plan, &ctx)?;
+    let plan2 = from_substrait_plan(&ctx, &proto).await?;
     let plan2 = ctx.state().optimize(&plan2)?;
 
     println!("{plan:#?}");
@@ -726,12 +904,12 @@ async fn function_extension_info(sql: &str) -> Result<(Vec<String>, Vec<u32>)> {
 }
 
 async fn create_context() -> Result<SessionContext> {
-    let state = SessionState::with_config_rt(
+    let state = SessionState::new_with_config_rt(
         SessionConfig::default(),
         Arc::new(RuntimeEnv::default()),
     )
     .with_serializer_registry(Arc::new(MockSerializerRegistry));
-    let ctx = SessionContext::with_state(state);
+    let ctx = SessionContext::new_with_state(state);
     let mut explicit_options = CsvReadOptions::new();
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int64, true),

@@ -24,8 +24,8 @@ use arrow::datatypes::{DataType, IntervalUnit};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{RewriteRecursion, TreeNodeRewriter};
 use datafusion_common::{
-    exec_err, internal_err, plan_err, DFSchema, DFSchemaRef, DataFusionError, Result,
-    ScalarValue,
+    exec_err, internal_err, plan_datafusion_err, plan_err, DFSchema, DFSchemaRef,
+    DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Exists, InList, InSubquery, Like, ScalarFunction,
@@ -41,7 +41,7 @@ use datafusion_expr::type_coercion::functions::data_types;
 use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_list,
 };
-use datafusion_expr::type_coercion::{is_datetime, is_numeric, is_utf8_or_large_utf8};
+use datafusion_expr::type_coercion::{is_datetime, is_utf8_or_large_utf8};
 use datafusion_expr::{
     is_false, is_not_false, is_not_true, is_not_unknown, is_true, is_unknown,
     type_coercion, window_function, AggregateFunction, BuiltinScalarFunction, Expr,
@@ -162,11 +162,10 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                 let new_plan = analyze_internal(&self.schema, &subquery.subquery)?;
                 let expr_type = expr.get_type(&self.schema)?;
                 let subquery_type = new_plan.schema().field(0).data_type();
-                let common_type = comparison_coercion(&expr_type, subquery_type).ok_or(DataFusionError::Plan(
-                    format!(
+                let common_type = comparison_coercion(&expr_type, subquery_type).ok_or(plan_datafusion_err!(
                         "expr type {expr_type:?} can't cast to {subquery_type:?} in InSubquery"
                     ),
-                ))?;
+                )?;
                 let new_subquery = Subquery {
                     subquery: Arc::new(new_plan),
                     outer_ref_columns: subquery.outer_ref_columns,
@@ -218,9 +217,9 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                     } else {
                         "LIKE"
                     };
-                    DataFusionError::Plan(format!(
+                    plan_datafusion_err!(
                         "There isn't a common type to coerce {left_type} and {right_type} in {op_name} expression"
-                    ))
+                    )
                 })?;
                 let expr = Box::new(expr.cast_to(&coerced_type, &self.schema)?);
                 let pattern = Box::new(pattern.cast_to(&coerced_type, &self.schema)?);
@@ -324,7 +323,7 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                 let new_expr = coerce_arguments_for_signature(
                     args.as_slice(),
                     &self.schema,
-                    &fun.signature,
+                    fun.signature(),
                 )?;
                 Ok(Expr::ScalarUDF(ScalarUDF::new(fun, new_expr)))
             }
@@ -365,7 +364,7 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                 let new_expr = coerce_arguments_for_signature(
                     args.as_slice(),
                     &self.schema,
-                    &fun.signature,
+                    fun.signature(),
                 )?;
                 let expr = Expr::AggregateUDF(expr::AggregateUDF::new(
                     fun, new_expr, filter, order_by,
@@ -496,7 +495,7 @@ fn coerce_window_frame(
     let target_type = match window_frame.units {
         WindowFrameUnits::Range => {
             if let Some(col_type) = current_types.first() {
-                if is_numeric(col_type) || is_utf8_or_large_utf8(col_type) {
+                if col_type.is_numeric() || is_utf8_or_large_utf8(col_type) {
                     col_type
                 } else if is_datetime(col_type) {
                     &DataType::Interval(IntervalUnit::MonthDayNano)
@@ -709,20 +708,20 @@ fn coerce_case_expression(case: Case, schema: &DFSchemaRef) -> Result<Case> {
             let coerced_type =
                 get_coerce_type_for_case_expression(&when_types, Some(case_type));
             coerced_type.ok_or_else(|| {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Failed to coerce case ({case_type:?}) and when ({when_types:?}) \
                      to common types in CASE WHEN expression"
-                ))
+                )
             })
         })
         .transpose()?;
     let then_else_coerce_type =
         get_coerce_type_for_case_expression(&then_types, else_type.as_ref()).ok_or_else(
             || {
-                DataFusionError::Plan(format!(
+                plan_datafusion_err!(
                     "Failed to coerce then ({then_types:?}) and else ({else_type:?}) \
                      to common types in CASE WHEN expression"
-                ))
+                )
             },
         )?;
 
@@ -764,6 +763,7 @@ fn coerce_case_expression(case: Case, schema: &DFSchemaRef) -> Result<Case> {
 mod test {
     use std::sync::Arc;
 
+    use arrow::array::{FixedSizeListArray, Int32Array};
     use arrow::datatypes::{DataType, TimeUnit};
 
     use arrow::datatypes::Field;
@@ -991,10 +991,13 @@ mod test {
             None,
             None,
         ));
-        let err = Projection::try_new(vec![agg_expr], empty).err().unwrap();
+        let err = Projection::try_new(vec![agg_expr], empty)
+            .err()
+            .unwrap()
+            .strip_backtrace();
         assert_eq!(
-            "Plan(\"No function matches the given name and argument types 'AVG(Utf8)'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\tAVG(Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64)\")",
-            &format!("{err:?}")
+            "Error during planning: No function matches the given name and argument types 'AVG(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tAVG(Int8/Int16/Int32/Int64/UInt8/UInt16/UInt32/UInt64/Float32/Float64)",
+            err
         );
         Ok(())
     }
@@ -1235,15 +1238,14 @@ mod test {
 
     #[test]
     fn test_casting_for_fixed_size_list() -> Result<()> {
-        let val = lit(ScalarValue::Fixedsizelist(
-            Some(vec![
-                ScalarValue::from(1i32),
-                ScalarValue::from(2i32),
-                ScalarValue::from(3i32),
-            ]),
-            Arc::new(Field::new("item", DataType::Int32, true)),
-            3,
-        ));
+        let val = lit(ScalarValue::FixedSizeList(Arc::new(
+            FixedSizeListArray::new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                3,
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                None,
+            ),
+        )));
         let expr = Expr::ScalarFunction(ScalarFunction {
             fun: BuiltinScalarFunction::MakeArray,
             args: vec![val.clone()],

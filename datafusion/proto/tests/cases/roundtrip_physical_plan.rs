@@ -21,27 +21,30 @@ use std::sync::Arc;
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::kernels::sort::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema};
-use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::file_format::json::JsonSink;
+use datafusion::datasource::listing::{ListingTableUrl, PartitionedFile};
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::{FileScanConfig, ParquetExec};
+use datafusion::datasource::physical_plan::{
+    FileScanConfig, FileSinkConfig, ParquetExec,
+};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::create_udf;
-use datafusion::logical_expr::{BuiltinScalarFunction, Volatility};
-use datafusion::logical_expr::{JoinType, Operator};
-use datafusion::physical_expr::expressions::GetFieldAccessExpr;
-use datafusion::physical_expr::expressions::{cast, in_list};
+use datafusion::logical_expr::{
+    create_udf, BuiltinScalarFunction, JoinType, Operator, Volatility,
+};
 use datafusion::physical_expr::window::SlidingAggregateWindowExpr;
-use datafusion::physical_expr::ScalarFunctionExpr;
-use datafusion::physical_plan::aggregates::PhysicalGroupBy;
-use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion::physical_expr::{PhysicalSortRequirement, ScalarFunctionExpr};
+use datafusion::physical_plan::aggregates::{
+    AggregateExec, AggregateMode, PhysicalGroupBy,
+};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::{
-    binary, col, like, lit, Avg, BinaryExpr, Column, DistinctCount, GetIndexedFieldExpr,
-    NotExpr, NthValue, PhysicalSortExpr, Sum,
+    binary, cast, col, in_list, like, lit, Avg, BinaryExpr, Column, DistinctCount,
+    GetFieldAccessExpr, GetIndexedFieldExpr, NotExpr, NthValue, PhysicalSortExpr, Sum,
 };
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::functions::make_scalar_function;
+use datafusion::physical_plan::insert::FileSinkExec;
 use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, PartitionMode};
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -49,11 +52,15 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::windows::{
     BuiltInWindowExpr, PlainAggregateWindowExpr, WindowAggExec,
 };
-use datafusion::physical_plan::{functions, udaf};
-use datafusion::physical_plan::{AggregateExpr, ExecutionPlan, PhysicalExpr, Statistics};
+use datafusion::physical_plan::{
+    functions, udaf, AggregateExpr, ExecutionPlan, PhysicalExpr, Statistics,
+};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use datafusion_common::Result;
+use datafusion_common::file_options::json_writer::JsonWriterOptions;
+use datafusion_common::parsers::CompressionTypeVariant;
+use datafusion_common::stats::Precision;
+use datafusion_common::{FileTypeWriterOptions, Result};
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, ReturnTypeFunction, Signature,
     StateTypeFunction, WindowFrame, WindowFrameBound,
@@ -275,7 +282,6 @@ fn roundtrip_window() -> Result<()> {
             sliding_aggr_window_expr,
         ],
         input,
-        schema.clone(),
         vec![col("b", &schema)?],
     )?))
 }
@@ -473,10 +479,11 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
             1024,
         )]],
         statistics: Statistics {
-            num_rows: Some(100),
-            total_byte_size: Some(1024),
-            column_statistics: None,
-            is_exact: false,
+            num_rows: Precision::Inexact(100),
+            total_byte_size: Precision::Inexact(1024),
+            column_statistics: Statistics::unknown_column(&Arc::new(Schema::new(vec![
+                Field::new("col", DataType::Utf8, false),
+            ]))),
         },
         projection: None,
         limit: None,
@@ -514,7 +521,7 @@ fn roundtrip_builtin_scalar_function() -> Result<()> {
         "acos",
         fun_expr,
         vec![col("a", &schema)?],
-        &DataType::Int64,
+        DataType::Int64,
         None,
     );
 
@@ -548,7 +555,7 @@ fn roundtrip_scalar_udf() -> Result<()> {
         "dummy",
         scalar_fn,
         vec![col("a", &schema)?],
-        &DataType::Int64,
+        DataType::Int64,
         None,
     );
 
@@ -697,7 +704,7 @@ fn roundtrip_get_indexed_field_list_range() -> Result<()> {
 }
 
 #[test]
-fn rountrip_analyze() -> Result<()> {
+fn roundtrip_analyze() -> Result<()> {
     let field_a = Field::new("plan_type", DataType::Utf8, false);
     let field_b = Field::new("plan", DataType::Utf8, false);
     let schema = Schema::new(vec![field_a, field_b]);
@@ -708,5 +715,42 @@ fn rountrip_analyze() -> Result<()> {
         false,
         input,
         Arc::new(schema),
+    )))
+}
+
+#[test]
+fn roundtrip_json_sink() -> Result<()> {
+    let field_a = Field::new("plan_type", DataType::Utf8, false);
+    let field_b = Field::new("plan", DataType::Utf8, false);
+    let schema = Arc::new(Schema::new(vec![field_a, field_b]));
+    let input = Arc::new(EmptyExec::new(true, schema.clone()));
+
+    let file_sink_config = FileSinkConfig {
+        object_store_url: ObjectStoreUrl::local_filesystem(),
+        file_groups: vec![PartitionedFile::new("/tmp".to_string(), 1)],
+        table_paths: vec![ListingTableUrl::parse("file:///")?],
+        output_schema: schema.clone(),
+        table_partition_cols: vec![("plan_type".to_string(), DataType::Utf8)],
+        single_file_output: true,
+        unbounded_input: false,
+        overwrite: true,
+        file_type_writer_options: FileTypeWriterOptions::JSON(JsonWriterOptions::new(
+            CompressionTypeVariant::UNCOMPRESSED,
+        )),
+    };
+    let data_sink = Arc::new(JsonSink::new(file_sink_config));
+    let sort_order = vec![PhysicalSortRequirement::new(
+        Arc::new(Column::new("plan_type", 0)),
+        Some(SortOptions {
+            descending: true,
+            nulls_first: false,
+        }),
+    )];
+
+    roundtrip_test(Arc::new(FileSinkExec::new(
+        input,
+        data_sink,
+        schema.clone(),
+        Some(sort_order),
     )))
 }

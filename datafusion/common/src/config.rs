@@ -254,6 +254,25 @@ config_namespace! {
 
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: usize, default = 32
+
+        /// Guarantees a minimum level of output files running in parallel.
+        /// RecordBatches will be distributed in round robin fashion to each
+        /// parallel writer. Each writer is closed and a new file opened once
+        /// soft_max_rows_per_output_file is reached.
+        pub minimum_parallel_output_files: usize, default = 4
+
+        /// Target number of rows in output files when writing multiple.
+        /// This is a soft max, so it can be exceeded slightly. There also
+        /// will be one file smaller than the limit if the total
+        /// number of rows written is not roughly divisible by the soft max
+        pub soft_max_rows_per_output_file: usize, default = 50000000
+
+        /// This is the maximum number of RecordBatches buffered
+        /// for each output file being worked. Higher values can potentially
+        /// give faster write performance at the cost of higher peak
+        /// memory consumption
+        pub max_buffered_batches_per_output_file: usize, default = 2
+
     }
 }
 
@@ -332,7 +351,7 @@ config_namespace! {
         /// Sets "created by" property
         pub created_by: String, default = concat!("datafusion version ", env!("CARGO_PKG_VERSION")).into()
 
-        /// Sets column index trucate length
+        /// Sets column index truncate length
         pub column_index_truncate_length: Option<usize>, default = None
 
         /// Sets best effort maximum number of rows in data page
@@ -358,12 +377,32 @@ config_namespace! {
         pub bloom_filter_ndv: Option<u64>, default = None
 
         /// Controls whether DataFusion will attempt to speed up writing
-        /// large parquet files by first writing multiple smaller files
-        /// and then stitching them together into a single large file.
-        /// This will result in faster write speeds, but higher memory usage.
-        /// Also currently unsupported are bloom filters and column indexes
-        /// when single_file_parallelism is enabled.
-        pub allow_single_file_parallelism: bool, default = false
+        /// parquet files by serializing them in parallel. Each column
+        /// in each row group in each output file are serialized in parallel
+        /// leveraging a maximum possible core count of n_files*n_row_groups*n_columns.
+        pub allow_single_file_parallelism: bool, default = true
+
+        /// By default parallel parquet writer is tuned for minimum
+        /// memory usage in a streaming execution plan. You may see
+        /// a performance benefit when writing large parquet files
+        /// by increasing maximum_parallel_row_group_writers and
+        /// maximum_buffered_record_batches_per_stream if your system
+        /// has idle cores and can tolerate additional memory usage.
+        /// Boosting these values is likely worthwhile when
+        /// writing out already in-memory data, such as from a cached
+        /// data frame.
+        pub maximum_parallel_row_group_writers: usize, default = 1
+
+        /// By default parallel parquet writer is tuned for minimum
+        /// memory usage in a streaming execution plan. You may see
+        /// a performance benefit when writing large parquet files
+        /// by increasing maximum_parallel_row_group_writers and
+        /// maximum_buffered_record_batches_per_stream if your system
+        /// has idle cores and can tolerate additional memory usage.
+        /// Boosting these values is likely worthwhile when
+        /// writing out already in-memory data, such as from a cached
+        /// data frame.
+        pub maximum_buffered_record_batches_per_stream: usize, default = 2
 
     }
 }
@@ -388,6 +427,11 @@ config_namespace! {
 config_namespace! {
     /// Options related to query optimization
     pub struct OptimizerOptions {
+        /// When set to true, the optimizer will push a limit operation into
+        /// grouped aggregations which have no aggregate expressions, as a soft limit,
+        /// emitting groups once the limit is reached, before all rows in the group are read.
+        pub enable_distinct_aggregation_soft_limit: bool, default = true
+
         /// When set to true, the physical plan optimizer will try to add round robin
         /// repartitioning to increase parallelism to leverage more CPU cores
         pub enable_round_robin_repartition: bool, default = true
@@ -453,11 +497,13 @@ config_namespace! {
         /// ```
         pub repartition_sorts: bool, default = true
 
-        /// When true, DataFusion will opportunistically remove sorts by replacing
-        /// `RepartitionExec` with `SortPreservingRepartitionExec`, and
-        /// `CoalescePartitionsExec` with `SortPreservingMergeExec`,
-        /// even when the query is bounded.
-        pub bounded_order_preserving_variants: bool, default = false
+        /// When true, DataFusion will opportunistically remove sorts when the data is already sorted,
+        /// (i.e. setting `preserve_order` to true on `RepartitionExec`  and
+        /// using `SortPreservingMergeExec`)
+        ///
+        /// When false, DataFusion will maximize plan parallelism using
+        /// `RepartitionExec` even if this requires subsequently resorting data using a `SortExec`.
+        pub prefer_existing_sort: bool, default = false
 
         /// When set to true, the logical plan optimizer will produce warning
         /// messages if any optimization rules produce errors and then proceed to the next

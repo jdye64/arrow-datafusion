@@ -29,13 +29,12 @@ mod value;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use arrow_schema::DataType;
-use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     internal_err, not_impl_err, plan_err, Column, DFSchema, DataFusionError, Result,
     ScalarValue,
 };
+use datafusion_expr::expr::InList;
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::expr::{InList, Placeholder};
 use datafusion_expr::{
     col, expr, lit, AggregateFunction, Between, BinaryExpr, BuiltinScalarFunction, Cast,
     Expr, ExprSchemable, GetFieldAccess, GetIndexedField, Like, Operator, TryCast,
@@ -122,7 +121,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let mut expr = self.sql_expr_to_logical_expr(sql, schema, planner_context)?;
         expr = self.rewrite_partial_qualifier(expr, schema);
         self.validate_schema_satisfies_exprs(schema, &[expr.clone()])?;
-        let expr = infer_placeholder_types(expr, schema)?;
+        let expr = expr.infer_placeholder_types(schema)?;
         Ok(expr)
     }
 
@@ -223,7 +222,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 planner_context,
             ),
 
-            SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(Cast::new(
+            SQLExpr::Cast {
+                expr, data_type, ..
+            } => Ok(Expr::Cast(Cast::new(
                 Box::new(self.sql_expr_to_logical_expr(
                     *expr,
                     schema,
@@ -232,7 +233,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 self.convert_data_type(&data_type)?,
             ))),
 
-            SQLExpr::TryCast { expr, data_type } => Ok(Expr::TryCast(TryCast::new(
+            SQLExpr::TryCast {
+                expr, data_type, ..
+            } => Ok(Expr::TryCast(TryCast::new(
                 Box::new(self.sql_expr_to_logical_expr(
                     *expr,
                     schema,
@@ -413,6 +416,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 expr,
                 trim_where,
                 trim_what,
+                ..
             } => self.sql_trim_to_expr(
                 *expr,
                 trim_where,
@@ -455,7 +459,19 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 schema,
                 planner_context,
             ),
-
+            SQLExpr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => self.sql_overlay_to_expr(
+                *expr,
+                *overlay_what,
+                *overlay_from,
+                overlay_for,
+                schema,
+                planner_context,
+            ),
             SQLExpr::Nested(e) => {
                 self.sql_expr_to_logical_expr(*e, schema, planner_context)
             }
@@ -478,8 +494,34 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 self.parse_array_agg(array_agg, schema, planner_context)
             }
 
+            SQLExpr::Struct { values, fields } => {
+                self.parse_struct(values, fields, schema, planner_context)
+            }
+
             _ => not_impl_err!("Unsupported ast node in sqltorel: {sql:?}"),
         }
+    }
+
+    fn parse_struct(
+        &self,
+        values: Vec<SQLExpr>,
+        fields: Vec<sqlparser::ast::StructField>,
+        input_schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Expr> {
+        if !fields.is_empty() {
+            return not_impl_err!("Struct fields are not supported yet");
+        }
+        let args = values
+            .into_iter()
+            .map(|value| {
+                self.sql_expr_to_logical_expr(value, input_schema, planner_context)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Expr::ScalarFunction(ScalarFunction::new(
+            BuiltinScalarFunction::Struct,
+            args,
+        )))
     }
 
     fn parse_array_agg(
@@ -615,6 +657,32 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         Ok(Expr::ScalarFunction(ScalarFunction::new(fun, args)))
     }
 
+    fn sql_overlay_to_expr(
+        &self,
+        expr: SQLExpr,
+        overlay_what: SQLExpr,
+        overlay_from: SQLExpr,
+        overlay_for: Option<Box<SQLExpr>>,
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<Expr> {
+        let fun = BuiltinScalarFunction::OverLay;
+        let arg = self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
+        let what_arg =
+            self.sql_expr_to_logical_expr(overlay_what, schema, planner_context)?;
+        let from_arg =
+            self.sql_expr_to_logical_expr(overlay_from, schema, planner_context)?;
+        let args = match overlay_for {
+            Some(for_expr) => {
+                let for_expr =
+                    self.sql_expr_to_logical_expr(*for_expr, schema, planner_context)?;
+                vec![arg, what_arg, from_arg, for_expr]
+            }
+            None => vec![arg, what_arg, from_arg],
+        };
+        Ok(Expr::ScalarFunction(ScalarFunction::new(fun, args)))
+    }
+
     fn sql_agg_with_filter_to_expr(
         &self,
         expr: SQLExpr,
@@ -712,39 +780,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 }
 
-// modifies expr if it is a placeholder with datatype of right
-fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
-    if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
-        if data_type.is_none() {
-            let other_dt = other.get_type(schema);
-            match other_dt {
-                Err(e) => {
-                    return Err(e.context(format!(
-                        "Can not find type of {other} needed to infer type of {expr}"
-                    )))?;
-                }
-                Ok(dt) => {
-                    *data_type = Some(dt);
-                }
-            }
-        };
-    }
-    Ok(())
-}
-
-/// Find all [`Expr::Placeholder`] tokens in a logical plan, and try
-/// to infer their [`DataType`] from the context of their use.
-fn infer_placeholder_types(expr: Expr, schema: &DFSchema) -> Result<Expr> {
-    expr.transform(&|mut expr| {
-        // Default to assuming the arguments are the same type
-        if let Expr::BinaryExpr(BinaryExpr { left, op: _, right }) = &mut expr {
-            rewrite_placeholder(left.as_mut(), right.as_ref(), schema)?;
-            rewrite_placeholder(right.as_mut(), left.as_ref(), schema)?;
-        };
-        Ok(Transformed::Yes(expr))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,12 +797,12 @@ mod tests {
 
     use crate::TableReference;
 
-    struct TestSchemaProvider {
+    struct TestContextProvider {
         options: ConfigOptions,
         tables: HashMap<String, Arc<dyn TableSource>>,
     }
 
-    impl TestSchemaProvider {
+    impl TestContextProvider {
         pub fn new() -> Self {
             let mut tables = HashMap::new();
             tables.insert(
@@ -786,11 +821,8 @@ mod tests {
         }
     }
 
-    impl ContextProvider for TestSchemaProvider {
-        fn get_table_provider(
-            &self,
-            name: TableReference,
-        ) -> Result<Arc<dyn TableSource>> {
+    impl ContextProvider for TestContextProvider {
+        fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
             match self.tables.get(name.table()) {
                 Some(table) => Ok(table.clone()),
                 _ => plan_err!("Table not found: {}", name.table()),
@@ -843,8 +875,8 @@ mod tests {
                         .unwrap();
                     let sql_expr = parser.parse_expr().unwrap();
 
-                    let schema_provider = TestSchemaProvider::new();
-                    let sql_to_rel = SqlToRel::new(&schema_provider);
+                    let context_provider = TestContextProvider::new();
+                    let sql_to_rel = SqlToRel::new(&context_provider);
 
                     // Should not stack overflow
                     sql_to_rel.sql_expr_to_logical_expr(

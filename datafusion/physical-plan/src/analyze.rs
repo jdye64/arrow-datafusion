@@ -20,18 +20,18 @@
 use std::sync::Arc;
 use std::{any::Any, time::Instant};
 
-use crate::{
-    display::DisplayableExecutionPlan, DisplayFormatType, ExecutionPlan, Partitioning,
-    Statistics,
-};
-use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{internal_err, DataFusionError, Result};
-use futures::StreamExt;
-
 use super::expressions::PhysicalSortExpr;
 use super::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use super::{DisplayAs, Distribution, SendableRecordBatchStream};
+
+use crate::display::DisplayableExecutionPlan;
+use crate::{DisplayFormatType, ExecutionPlan, Partitioning};
+
+use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
+use datafusion_common::{internal_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
+
+use futures::StreamExt;
 
 /// `EXPLAIN ANALYZE` execution plan operator. This operator runs its input,
 /// discards the results, and then prints out an annotated plan with metrics
@@ -194,11 +194,6 @@ impl ExecutionPlan for AnalyzeExec {
             self.schema.clone(),
             futures::stream::once(output),
         )))
-    }
-
-    fn statistics(&self) -> Statistics {
-        // Statistics an an ANALYZE plan are not relevant
-        Statistics::default()
     }
 }
 

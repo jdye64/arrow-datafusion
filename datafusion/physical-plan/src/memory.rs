@@ -17,23 +17,23 @@
 
 //! Execution plan for reading in-memory batches of data
 
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use super::expressions::PhysicalSortExpr;
 use super::{
     common, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use core::fmt;
-use datafusion_common::{internal_err, project_schema, Result};
-use std::any::Any;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use crate::ordering_equivalence_properties_helper;
-use datafusion_common::DataFusionError;
+use datafusion_common::{internal_err, project_schema, DataFusionError, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{LexOrdering, OrderingEquivalenceProperties};
+use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
+
 use futures::Stream;
 
 /// Execution plan for reading in-memory batches of data
@@ -77,11 +77,12 @@ impl DisplayAs for MemoryExec {
                     .sort_information
                     .first()
                     .map(|output_ordering| {
-                        let order_strings: Vec<_> =
-                            output_ordering.iter().map(|e| e.to_string()).collect();
-                        format!(", output_ordering={}", order_strings.join(","))
+                        format!(
+                            ", output_ordering={}",
+                            PhysicalSortExpr::format_list(output_ordering)
+                        )
                     })
-                    .unwrap_or_else(|| "".to_string());
+                    .unwrap_or_default();
 
                 write!(
                     f,
@@ -120,8 +121,8 @@ impl ExecutionPlan for MemoryExec {
             .map(|ordering| ordering.as_slice())
     }
 
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        ordering_equivalence_properties_helper(self.schema(), &self.sort_information)
+    fn equivalence_properties(&self) -> EquivalenceProperties {
+        EquivalenceProperties::new_with_orderings(self.schema(), &self.sort_information)
     }
 
     fn with_new_children(
@@ -149,12 +150,12 @@ impl ExecutionPlan for MemoryExec {
     }
 
     /// We recompute the statistics dynamically from the arrow metadata as it is pretty cheap to do so
-    fn statistics(&self) -> Statistics {
-        common::compute_record_batch_statistics(
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(common::compute_record_batch_statistics(
             &self.partitions,
             &self.schema,
             self.projection.clone(),
-        )
+        ))
     }
 }
 
@@ -176,8 +177,16 @@ impl MemoryExec {
         })
     }
 
+    pub fn partitions(&self) -> &[Vec<RecordBatch>] {
+        &self.partitions
+    }
+
+    pub fn projection(&self) -> &Option<Vec<usize>> {
+        &self.projection
+    }
+
     /// A memory table can be ordered by multiple expressions simultaneously.
-    /// `OrderingEquivalenceProperties` keeps track of expressions that describe the
+    /// [`EquivalenceProperties`] keeps track of expressions that describe the
     /// global ordering of the schema. These columns are not necessarily same; e.g.
     /// ```text
     /// ┌-------┐
@@ -190,13 +199,15 @@ impl MemoryExec {
     /// └---┴---┘
     /// ```
     /// where both `a ASC` and `b DESC` can describe the table ordering. With
-    /// `OrderingEquivalenceProperties`, we can keep track of these equivalences
-    /// and treat `a ASC` and `b DESC` as the same ordering requirement
-    /// by outputting the `a ASC` from output_ordering API
-    /// and add `b DESC` into `OrderingEquivalenceProperties`
+    /// [`EquivalenceProperties`], we can keep track of these equivalences
+    /// and treat `a ASC` and `b DESC` as the same ordering requirement.
     pub fn with_sort_information(mut self, sort_information: Vec<LexOrdering>) -> Self {
         self.sort_information = sort_information;
         self
+    }
+
+    pub fn original_schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
@@ -265,12 +276,14 @@ impl RecordBatchStream for MemoryStream {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::memory::MemoryExec;
     use crate::ExecutionPlan;
+
     use arrow_schema::{DataType, Field, Schema, SortOptions};
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::PhysicalSortExpr;
-    use std::sync::Arc;
 
     #[test]
     fn test_memory_order_eq() -> datafusion_common::Result<()> {
@@ -299,11 +312,8 @@ mod tests {
             .with_sort_information(sort_information);
 
         assert_eq!(mem_exec.output_ordering().unwrap(), expected_output_order);
-        let order_eq = mem_exec.ordering_equivalence_properties();
-        assert!(order_eq
-            .oeq_class()
-            .map(|class| class.contains(&expected_order_eq))
-            .unwrap_or(false));
+        let eq_properties = mem_exec.equivalence_properties();
+        assert!(eq_properties.oeq_class().contains(&expected_order_eq));
         Ok(())
     }
 }

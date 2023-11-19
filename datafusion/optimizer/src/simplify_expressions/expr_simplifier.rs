@@ -30,7 +30,10 @@ use arrow::{
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use datafusion_common::tree_node::{RewriteRecursion, TreeNode, TreeNodeRewriter};
+use datafusion_common::{
+    cast::{as_large_list_array, as_list_array},
+    tree_node::{RewriteRecursion, TreeNode, TreeNodeRewriter},
+};
 use datafusion_common::{
     exec_err, internal_err, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue,
 };
@@ -340,14 +343,13 @@ impl<'a> ConstEvaluator<'a> {
             | Expr::WindowFunction { .. }
             | Expr::Sort { .. }
             | Expr::GroupingSet(_)
-            | Expr::Wildcard
-            | Expr::QualifiedWildcard { .. }
+            | Expr::Wildcard { .. }
             | Expr::Placeholder(_) => false,
             Expr::ScalarFunction(ScalarFunction { fun, .. }) => {
                 Self::volatility_ok(fun.volatility())
             }
             Expr::ScalarUDF(expr::ScalarUDF { fun, .. }) => {
-                Self::volatility_ok(fun.signature.volatility)
+                Self::volatility_ok(fun.signature().volatility)
             }
             Expr::Literal(_)
             | Expr::BinaryExpr { .. }
@@ -392,8 +394,11 @@ impl<'a> ConstEvaluator<'a> {
                         "Could not evaluate the expression, found a result of length {}",
                         a.len()
                     )
+                } else if as_list_array(&a).is_ok() || as_large_list_array(&a).is_ok() {
+                    Ok(ScalarValue::List(a))
                 } else {
-                    Ok(ScalarValue::try_from_array(&a, 0)?)
+                    // Non-ListArray
+                    ScalarValue::try_from_array(&a, 0)
                 }
             }
             ColumnarValue::Scalar(s) => Ok(s),
@@ -1495,7 +1500,7 @@ mod tests {
         test_evaluate(expr, lit("foobarbaz"));
 
         // Check non string arguments
-        // to_timestamp("2020-09-08T12:00:00+00:00") --> timestamp(1599566400000000000i64)
+        // to_timestamp("2020-09-08T12:00:00+00:00") --> timestamp(1599566400i64)
         let expr =
             call_fn("to_timestamp", vec![lit("2020-09-08T12:00:00+00:00")]).unwrap();
         test_evaluate(expr, lit_timestamp_nano(1599566400000000000i64));

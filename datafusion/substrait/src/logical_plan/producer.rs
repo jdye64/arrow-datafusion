@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use datafusion::logical_expr::{Like, WindowFrameUnits};
+use datafusion::logical_expr::{Distinct, Like, WindowFrameUnits};
 use datafusion::{
     arrow::datatypes::{DataType, TimeUnit},
     error::{DataFusionError, Result},
@@ -244,11 +244,11 @@ pub fn to_substrait_rel(
                 }))),
             }))
         }
-        LogicalPlan::Distinct(distinct) => {
+        LogicalPlan::Distinct(Distinct::All(plan)) => {
             // Use Substrait's AggregateRel with empty measures to represent `select distinct`
-            let input = to_substrait_rel(distinct.input.as_ref(), ctx, extension_info)?;
+            let input = to_substrait_rel(plan.as_ref(), ctx, extension_info)?;
             // Get grouping keys from the input relation's number of output fields
-            let grouping = (0..distinct.input.schema().fields().len())
+            let grouping = (0..plan.schema().fields().len())
                 .map(substrait_field_ref)
                 .collect::<Result<Vec<_>>>()?;
 
@@ -278,14 +278,15 @@ pub fn to_substrait_rel(
             // parse filter if exists
             let in_join_schema = join.left.schema().join(join.right.schema())?;
             let join_filter = match &join.filter {
-                Some(filter) => Some(Box::new(to_substrait_rex(
+                Some(filter) => Some(to_substrait_rex(
                     filter,
                     &Arc::new(in_join_schema),
                     0,
                     extension_info,
-                )?)),
+                )?),
                 None => None,
             };
+
             // map the left and right columns to binary expressions in the form `l = r`
             // build a single expression for the ON condition, such as `l.a = r.a AND l.b = r.b`
             let eq_op = if join.null_equals_null {
@@ -293,15 +294,31 @@ pub fn to_substrait_rel(
             } else {
                 Operator::Eq
             };
-
-            let join_expr = to_substrait_join_expr(
+            let join_on = to_substrait_join_expr(
                 &join.on,
                 eq_op,
                 join.left.schema(),
                 join.right.schema(),
                 extension_info,
-            )?
-            .map(Box::new);
+            )?;
+
+            // create conjunction between `join_on` and `join_filter` to embed all join conditions,
+            // whether equal or non-equal in a single expression
+            let join_expr = match &join_on {
+                Some(on_expr) => match &join_filter {
+                    Some(filter) => Some(Box::new(make_binary_op_scalar_func(
+                        on_expr,
+                        filter,
+                        Operator::And,
+                        extension_info,
+                    ))),
+                    None => join_on.map(Box::new), // the join expression will only contain `join_on` if filter doesn't exist
+                },
+                None => match &join_filter {
+                    Some(_) => join_filter.map(Box::new), // the join expression will only contain `join_filter` if the `on` condition doesn't exist
+                    None => None,
+                },
+            };
 
             Ok(Box::new(Rel {
                 rel_type: Some(RelType::Join(Box::new(JoinRel {
@@ -310,7 +327,7 @@ pub fn to_substrait_rel(
                     right: Some(right),
                     r#type: join_type as i32,
                     expression: join_expr,
-                    post_join_filter: join_filter,
+                    post_join_filter: None,
                     advanced_extension: None,
                 }))),
             }))
@@ -571,8 +588,7 @@ pub fn to_substrait_agg_measure(
             for arg in args {
                 arguments.push(FunctionArgument { arg_type: Some(ArgType::Value(to_substrait_rex(arg, schema, 0, extension_info)?)) });
             }
-            let function_name = fun.to_string().to_lowercase();
-            let function_anchor = _register_function(function_name, extension_info);
+            let function_anchor = _register_function(fun.to_string(), extension_info);
             Ok(Measure {
                 measure: Some(AggregateFunction {
                     function_reference: function_anchor,
@@ -593,6 +609,34 @@ pub fn to_substrait_agg_measure(
                 }
             })
         }
+        Expr::AggregateUDF(expr::AggregateUDF{ fun, args, filter, order_by }) =>{
+            let sorts = if let Some(order_by) = order_by {
+                order_by.iter().map(|expr| to_substrait_sort_field(expr, schema, extension_info)).collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            let mut arguments: Vec<FunctionArgument> = vec![];
+            for arg in args {
+                arguments.push(FunctionArgument { arg_type: Some(ArgType::Value(to_substrait_rex(arg, schema, 0, extension_info)?)) });
+            }
+            let function_anchor = _register_function(fun.name().to_string(), extension_info);
+            Ok(Measure {
+                measure: Some(AggregateFunction {
+                    function_reference: function_anchor,
+                    arguments,
+                    sorts,
+                    output_type: None,
+                    invocation: AggregationInvocation::All as i32,
+                    phase: AggregationPhase::Unspecified as i32,
+                    args: vec![],
+                    options: vec![],
+                }),
+                filter: match filter {
+                    Some(f) => Some(to_substrait_rex(f, schema, 0, extension_info)?),
+                    None => None
+                }
+            })
+        },
         Expr::Alias(Alias{expr,..})=> {
             to_substrait_agg_measure(expr, schema, extension_info)
         }
@@ -686,8 +730,8 @@ pub fn make_binary_op_scalar_func(
         HashMap<String, u32>,
     ),
 ) -> Expression {
-    let function_name = operator_to_name(op).to_string().to_lowercase();
-    let function_anchor = _register_function(function_name, extension_info);
+    let function_anchor =
+        _register_function(operator_to_name(op).to_string(), extension_info);
     Expression {
         rex_type: Some(RexType::ScalarFunction(ScalarFunction {
             function_reference: function_anchor,
@@ -790,8 +834,7 @@ pub fn to_substrait_rex(
                     )?)),
                 });
             }
-            let function_name = fun.to_string().to_lowercase();
-            let function_anchor = _register_function(function_name, extension_info);
+            let function_anchor = _register_function(fun.to_string(), extension_info);
             Ok(Expression {
                 rex_type: Some(RexType::ScalarFunction(ScalarFunction {
                     function_reference: function_anchor,
@@ -956,8 +999,7 @@ pub fn to_substrait_rex(
             window_frame,
         }) => {
             // function reference
-            let function_name = fun.to_string().to_lowercase();
-            let function_anchor = _register_function(function_name, extension_info);
+            let function_anchor = _register_function(fun.to_string(), extension_info);
             // arguments
             let mut arguments: Vec<FunctionArgument> = vec![];
             for arg in args {
@@ -1008,7 +1050,53 @@ pub fn to_substrait_rex(
             col_ref_offset,
             extension_info,
         ),
-        _ => not_impl_err!("Unsupported expression: {expr:?}"),
+        Expr::IsNull(arg) => {
+            let arguments: Vec<FunctionArgument> = vec![FunctionArgument {
+                arg_type: Some(ArgType::Value(to_substrait_rex(
+                    arg,
+                    schema,
+                    col_ref_offset,
+                    extension_info,
+                )?)),
+            }];
+
+            let function_name = "is_null".to_string();
+            let function_anchor = _register_function(function_name, extension_info);
+            Ok(Expression {
+                rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                    function_reference: function_anchor,
+                    arguments,
+                    output_type: None,
+                    args: vec![],
+                    options: vec![],
+                })),
+            })
+        }
+        Expr::IsNotNull(arg) => {
+            let arguments: Vec<FunctionArgument> = vec![FunctionArgument {
+                arg_type: Some(ArgType::Value(to_substrait_rex(
+                    arg,
+                    schema,
+                    col_ref_offset,
+                    extension_info,
+                )?)),
+            }];
+
+            let function_name = "is_not_null".to_string();
+            let function_anchor = _register_function(function_name, extension_info);
+            Ok(Expression {
+                rex_type: Some(RexType::ScalarFunction(ScalarFunction {
+                    function_reference: function_anchor,
+                    arguments,
+                    output_type: None,
+                    args: vec![],
+                    options: vec![],
+                })),
+            })
+        }
+        _ => {
+            not_impl_err!("Unsupported expression: {expr:?}")
+        }
     }
 }
 

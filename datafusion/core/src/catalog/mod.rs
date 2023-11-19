@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 /// Represent a list of named catalogs
 pub trait CatalogList: Sync + Send {
-    /// Returns the catalog list as [`Any`](std::any::Any)
+    /// Returns the catalog list as [`Any`]
     /// so that it can be downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -93,15 +93,9 @@ impl CatalogList for MemoryCatalogList {
     }
 }
 
-impl Default for MemoryCatalogProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Represents a catalog, comprising a number of named schemas.
 pub trait CatalogProvider: Sync + Send {
-    /// Returns the catalog provider as [`Any`](std::any::Any)
+    /// Returns the catalog provider as [`Any`]
     /// so that it can be downcast to a specific implementation.
     fn as_any(&self) -> &dyn Any;
 
@@ -158,6 +152,12 @@ impl MemoryCatalogProvider {
         Self {
             schemas: DashMap::new(),
         }
+    }
+}
+
+impl Default for MemoryCatalogProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

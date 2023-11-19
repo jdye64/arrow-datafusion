@@ -24,6 +24,8 @@ use crate::eliminate_duplicated_expr::EliminateDuplicatedExpr;
 use crate::eliminate_filter::EliminateFilter;
 use crate::eliminate_join::EliminateJoin;
 use crate::eliminate_limit::EliminateLimit;
+use crate::eliminate_nested_union::EliminateNestedUnion;
+use crate::eliminate_one_union::EliminateOneUnion;
 use crate::eliminate_outer_join::EliminateOuterJoin;
 use crate::eliminate_project::EliminateProjection;
 use crate::extract_equijoin_predicate::ExtractEquijoinPredicate;
@@ -220,6 +222,7 @@ impl Optimizer {
     /// Create a new optimizer using the recommended list of rules
     pub fn new() -> Self {
         let rules: Vec<Arc<dyn OptimizerRule + Sync + Send>> = vec![
+            Arc::new(EliminateNestedUnion::new()),
             Arc::new(SimplifyExpressions::new()),
             Arc::new(UnwrapCastInComparison::new()),
             Arc::new(ReplaceDistinctWithAggregate::new()),
@@ -239,6 +242,8 @@ impl Optimizer {
             Arc::new(CommonSubexprEliminate::new()),
             Arc::new(EliminateLimit::new()),
             Arc::new(PropagateEmptyRelation::new()),
+            // Must be after PropagateEmptyRelation
+            Arc::new(EliminateOneUnion::new()),
             Arc::new(FilterNullJoinKeys::default()),
             Arc::new(EliminateOuterJoin::new()),
             // Filters can't be pushed down past Limits, we should do PushDownFilter after PushDownLimit
@@ -422,7 +427,7 @@ impl Optimizer {
 /// Returns an error if plans have different schemas.
 ///
 /// It ignores metadata and nullability.
-fn assert_schema_is_the_same(
+pub(crate) fn assert_schema_is_the_same(
     rule_name: &str,
     prev_plan: &LogicalPlan,
     new_plan: &LogicalPlan,
@@ -433,7 +438,7 @@ fn assert_schema_is_the_same(
 
     if !equivalent {
         let e = DataFusionError::Internal(format!(
-            "Failed due to generate a different schema, original schema: {:?}, new schema: {:?}",
+            "Failed due to a difference in schemas, original schema: {:?}, new schema: {:?}",
             prev_plan.schema(),
             new_plan.schema()
         ));
@@ -498,7 +503,7 @@ mod tests {
         let err = opt.optimize(&plan, &config, &observe).unwrap_err();
         assert_eq!(
             "Optimizer rule 'get table_scan rule' failed\ncaused by\nget table_scan rule\ncaused by\n\
-             Internal error: Failed due to generate a different schema, \
+             Internal error: Failed due to a difference in schemas, \
              original schema: DFSchema { fields: [], metadata: {}, functional_dependencies: FunctionalDependencies { deps: [] } }, \
              new schema: DFSchema { fields: [\
              DFField { qualifier: Some(Bare { table: \"test\" }), field: Field { name: \"a\", data_type: UInt32, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, \

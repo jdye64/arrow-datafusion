@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+
 use datafusion::config::ConfigOptions;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::Timestamp;
@@ -27,7 +28,7 @@ async fn explain_analyze_baseline_metrics() {
     let config = SessionConfig::new()
         .with_target_partitions(3)
         .with_batch_size(4096);
-    let ctx = SessionContext::with_config(config);
+    let ctx = SessionContext::new_with_config(config);
     register_aggregate_csv_by_sql(&ctx).await;
     // a query with as many operators as we have metrics for
     let sql = "EXPLAIN ANALYZE \
@@ -598,7 +599,7 @@ async fn test_physical_plan_display_indent() {
     let config = SessionConfig::new()
         .with_target_partitions(9000)
         .with_batch_size(4096);
-    let ctx = SessionContext::with_config(config);
+    let ctx = SessionContext::new_with_config(config);
     register_aggregate_csv(&ctx).await.unwrap();
     let sql = "SELECT c1, MAX(c12), MIN(c12) as the_min \
                FROM aggregate_test_100 \
@@ -611,7 +612,7 @@ async fn test_physical_plan_display_indent() {
     let expected = vec![
         "GlobalLimitExec: skip=0, fetch=10",
         "  SortPreservingMergeExec: [the_min@2 DESC], fetch=10",
-        "    SortExec: fetch=10, expr=[the_min@2 DESC]",
+        "    SortExec: TopK(fetch=10), expr=[the_min@2 DESC]",
         "      ProjectionExec: expr=[c1@0 as c1, MAX(aggregate_test_100.c12)@1 as MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)@2 as the_min]",
         "        AggregateExec: mode=FinalPartitioned, gby=[c1@0 as c1], aggr=[MAX(aggregate_test_100.c12), MIN(aggregate_test_100.c12)]",
         "          CoalesceBatchesExec: target_batch_size=4096",
@@ -642,7 +643,7 @@ async fn test_physical_plan_display_indent_multi_children() {
     let config = SessionConfig::new()
         .with_target_partitions(9000)
         .with_batch_size(4096);
-    let ctx = SessionContext::with_config(config);
+    let ctx = SessionContext::new_with_config(config);
     // ensure indenting works for nodes with multiple children
     register_aggregate_csv(&ctx).await.unwrap();
     let sql = "SELECT c1 \
@@ -777,7 +778,7 @@ async fn csv_explain_analyze_verbose() {
 async fn explain_logical_plan_only() {
     let mut config = ConfigOptions::new();
     config.explain.logical_plan_only = true;
-    let ctx = SessionContext::with_config(config.into());
+    let ctx = SessionContext::new_with_config(config.into());
     let sql = "EXPLAIN select count(*) from (values ('a', 1, 100), ('a', 2, 150)) as t (c1,c2,c3)";
     let actual = execute(&ctx, sql).await;
     let actual = normalize_vec_for_explain(actual);
@@ -787,7 +788,7 @@ async fn explain_logical_plan_only() {
             "logical_plan",
             "Aggregate: groupBy=[[]], aggr=[[COUNT(UInt8(1)) AS COUNT(*)]]\
             \n  SubqueryAlias: t\
-            \n    Projection: column1\
+            \n    Projection: \
             \n      Values: (Utf8(\"a\"), Int64(1), Int64(100)), (Utf8(\"a\"), Int64(2), Int64(150))"
         ]];
     assert_eq!(expected, actual);
@@ -797,14 +798,14 @@ async fn explain_logical_plan_only() {
 async fn explain_physical_plan_only() {
     let mut config = ConfigOptions::new();
     config.explain.physical_plan_only = true;
-    let ctx = SessionContext::with_config(config.into());
+    let ctx = SessionContext::new_with_config(config.into());
     let sql = "EXPLAIN select count(*) from (values ('a', 1, 100), ('a', 2, 150)) as t (c1,c2,c3)";
     let actual = execute(&ctx, sql).await;
     let actual = normalize_vec_for_explain(actual);
 
     let expected = vec![vec![
         "physical_plan",
-        "ProjectionExec: expr=[2 as COUNT(UInt8(1))]\
+        "ProjectionExec: expr=[2 as COUNT(*)]\
         \n  EmptyExec: produce_one_row=true\
         \n",
     ]];
@@ -816,7 +817,7 @@ async fn csv_explain_analyze_with_statistics() {
     let mut config = ConfigOptions::new();
     config.explain.physical_plan_only = true;
     config.explain.show_statistics = true;
-    let ctx = SessionContext::with_config(config.into());
+    let ctx = SessionContext::new_with_config(config.into());
     register_aggregate_csv_by_sql(&ctx).await;
 
     let sql = "EXPLAIN ANALYZE SELECT c1 FROM aggregate_test_100";
@@ -826,5 +827,8 @@ async fn csv_explain_analyze_with_statistics() {
         .to_string();
 
     // should contain scan statistics
-    assert_contains!(&formatted, ", statistics=[]");
+    assert_contains!(
+        &formatted,
+        ", statistics=[Rows=Absent, Bytes=Absent, [(Col[0]:)]]"
+    );
 }

@@ -17,19 +17,15 @@
 
 //! Join related functionality used both on logical and physical plans
 
-use std::cmp::max;
 use std::collections::HashSet;
-use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::usize;
 
+use crate::joins::hash_join_utils::{build_filter_input_order, SortedFilterExpr};
 use crate::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
-use crate::SchemaRef;
-use crate::{
-    ColumnStatistics, EquivalenceProperties, ExecutionPlan, Partitioning, Statistics,
-};
+use crate::{ColumnStatistics, ExecutionPlan, Partitioning, Statistics};
 
 use arrow::array::{
     downcast_array, new_null_array, Array, BooleanBufferBuilder, UInt32Array,
@@ -39,20 +35,19 @@ use arrow::compute;
 use arrow::datatypes::{Field, Schema, SchemaBuilder};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::stats::Precision;
 use datafusion_common::{
-    exec_err, plan_err, DataFusionError, JoinType, Result, ScalarValue, SharedResult,
+    plan_datafusion_err, plan_err, DataFusionError, JoinSide, JoinType, Result,
+    SharedResult,
 };
+use datafusion_physical_expr::equivalence::add_offset_to_expr;
 use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::intervals::{ExprIntervalGraph, Interval, IntervalBound};
+use datafusion_physical_expr::utils::merge_vectors;
 use datafusion_physical_expr::{
-    add_offset_to_lex_ordering, EquivalentClass, LexOrdering, LexOrderingRef,
-    OrderingEquivalenceProperties, OrderingEquivalentClass, PhysicalExpr,
-    PhysicalSortExpr,
+    LexOrdering, LexOrderingRef, PhysicalExpr, PhysicalSortExpr,
 };
 
-use crate::joins::hash_join_utils::{build_filter_input_order, SortedFilterExpr};
-use datafusion_physical_expr::intervals::ExprIntervalGraph;
-use datafusion_physical_expr::utils::merge_vectors;
 use futures::future::{BoxFuture, Shared};
 use futures::{ready, FutureExt};
 use parking_lot::Mutex;
@@ -96,8 +91,8 @@ fn check_join_set_is_valid(
 
     if !left_missing.is_empty() | !right_missing.is_empty() {
         return plan_err!(
-                "The left or right side of the join does not have all columns on \"on\": \nMissing on the left: {left_missing:?}\nMissing on the right: {right_missing:?}"
-            );
+            "The left or right side of the join does not have all columns on \"on\": \nMissing on the left: {left_missing:?}\nMissing on the right: {right_missing:?}"
+        );
     };
 
     Ok(())
@@ -137,17 +132,8 @@ pub fn adjust_right_output_partitioning(
         Partitioning::Hash(exprs, size) => {
             let new_exprs = exprs
                 .into_iter()
-                .map(|expr| {
-                    expr.transform_down(&|e| match e.as_any().downcast_ref::<Column>() {
-                        Some(col) => Ok(Transformed::Yes(Arc::new(Column::new(
-                            col.name(),
-                            left_columns_len + col.index(),
-                        )))),
-                        None => Ok(Transformed::No(e)),
-                    })
-                    .unwrap()
-                })
-                .collect::<Vec<_>>();
+                .map(|expr| add_offset_to_expr(expr, left_columns_len))
+                .collect();
             Partitioning::Hash(new_exprs, size)
         }
     }
@@ -182,24 +168,23 @@ pub fn calculate_join_output_ordering(
     left_columns_len: usize,
     maintains_input_order: &[bool],
     probe_side: Option<JoinSide>,
-) -> Result<Option<LexOrdering>> {
-    // All joins have 2 children:
-    assert_eq!(maintains_input_order.len(), 2);
-    let left_maintains = maintains_input_order[0];
-    let right_maintains = maintains_input_order[1];
+) -> Option<LexOrdering> {
     let mut right_ordering = match join_type {
         // In the case below, right ordering should be offseted with the left
         // side length, since we append the right table to the left table.
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-            add_offset_to_lex_ordering(right_ordering, left_columns_len)?
+            right_ordering
+                .iter()
+                .map(|sort_expr| PhysicalSortExpr {
+                    expr: add_offset_to_expr(sort_expr.expr.clone(), left_columns_len),
+                    options: sort_expr.options,
+                })
+                .collect()
         }
         _ => right_ordering.to_vec(),
     };
-    let output_ordering = match (left_maintains, right_maintains) {
-        (true, true) => {
-            return exec_err!("Cannot maintain ordering of both sides");
-        }
-        (true, false) => {
+    let output_ordering = match maintains_input_order {
+        [true, false] => {
             // Special case, we can prefix ordering of right side with the ordering of left side.
             if join_type == JoinType::Inner && probe_side == Some(JoinSide::Left) {
                 replace_on_columns_of_right_ordering(
@@ -212,7 +197,7 @@ pub fn calculate_join_output_ordering(
                 left_ordering.to_vec()
             }
         }
-        (false, true) => {
+        [false, true] => {
             // Special case, we can prefix ordering of left side with the ordering of right side.
             if join_type == JoinType::Inner && probe_side == Some(JoinSide::Right) {
                 replace_on_columns_of_right_ordering(
@@ -226,269 +211,15 @@ pub fn calculate_join_output_ordering(
             }
         }
         // Doesn't maintain ordering, output ordering is None.
-        (false, false) => return Ok(None),
+        [false, false] => return None,
+        [true, true] => unreachable!("Cannot maintain ordering of both sides"),
+        _ => unreachable!("Join operators can not have more than two children"),
     };
-    Ok((!output_ordering.is_empty()).then_some(output_ordering))
-}
-
-/// Combine equivalence properties of the given join inputs.
-pub fn combine_join_equivalence_properties(
-    join_type: JoinType,
-    left_properties: EquivalenceProperties,
-    right_properties: EquivalenceProperties,
-    left_columns_len: usize,
-    on: &[(Column, Column)],
-    schema: SchemaRef,
-) -> EquivalenceProperties {
-    let mut new_properties = EquivalenceProperties::new(schema);
-    match join_type {
-        JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
-            new_properties.extend(left_properties.classes().to_vec());
-            let new_right_properties = right_properties
-                .classes()
-                .iter()
-                .map(|prop| {
-                    let new_head = Column::new(
-                        prop.head().name(),
-                        left_columns_len + prop.head().index(),
-                    );
-                    let new_others = prop
-                        .others()
-                        .iter()
-                        .map(|col| {
-                            Column::new(col.name(), left_columns_len + col.index())
-                        })
-                        .collect::<Vec<_>>();
-                    EquivalentClass::new(new_head, new_others)
-                })
-                .collect::<Vec<_>>();
-
-            new_properties.extend(new_right_properties);
-        }
-        JoinType::LeftSemi | JoinType::LeftAnti => {
-            new_properties.extend(left_properties.classes().to_vec())
-        }
-        JoinType::RightSemi | JoinType::RightAnti => {
-            new_properties.extend(right_properties.classes().to_vec())
-        }
-    }
-
-    if join_type == JoinType::Inner {
-        on.iter().for_each(|(column1, column2)| {
-            let new_column2 =
-                Column::new(column2.name(), left_columns_len + column2.index());
-            new_properties.add_equal_conditions((column1, &new_column2))
-        })
-    }
-    new_properties
-}
-
-/// Calculate equivalence properties for the given cross join operation.
-pub fn cross_join_equivalence_properties(
-    left_properties: EquivalenceProperties,
-    right_properties: EquivalenceProperties,
-    left_columns_len: usize,
-    schema: SchemaRef,
-) -> EquivalenceProperties {
-    let mut new_properties = EquivalenceProperties::new(schema);
-    new_properties.extend(left_properties.classes().to_vec());
-    let new_right_properties = right_properties
-        .classes()
-        .iter()
-        .map(|prop| {
-            let new_head =
-                Column::new(prop.head().name(), left_columns_len + prop.head().index());
-            let new_others = prop
-                .others()
-                .iter()
-                .map(|col| Column::new(col.name(), left_columns_len + col.index()))
-                .collect::<Vec<_>>();
-            EquivalentClass::new(new_head, new_others)
-        })
-        .collect::<Vec<_>>();
-    new_properties.extend(new_right_properties);
-    new_properties
-}
-
-/// Update right table ordering equivalences so that:
-/// - They point to valid indices at the output of the join schema, and
-/// - They are normalized with respect to equivalence columns.
-///
-/// To do so, we increment column indices by the size of the left table when
-/// join schema consists of a combination of left and right schema (Inner,
-/// Left, Full, Right joins). Then, we normalize the sort expressions of
-/// ordering equivalences one by one. We make sure that each expression in the
-/// ordering equivalence is either:
-/// - The head of the one of the equivalent classes, or
-/// - Doesn't have an equivalent column.
-///
-/// This way; once we normalize an expression according to equivalence properties,
-/// it can thereafter safely be used for ordering equivalence normalization.
-fn get_updated_right_ordering_equivalent_class(
-    join_type: &JoinType,
-    right_oeq_class: &OrderingEquivalentClass,
-    left_columns_len: usize,
-    join_eq_properties: &EquivalenceProperties,
-) -> Result<OrderingEquivalentClass> {
-    match join_type {
-        // In these modes, indices of the right schema should be offset by
-        // the left table size.
-        JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
-            let right_oeq_class = right_oeq_class.add_offset(left_columns_len)?;
-            return Ok(
-                right_oeq_class.normalize_with_equivalence_properties(join_eq_properties)
-            );
-        }
-        _ => {}
-    };
-    Ok(right_oeq_class.normalize_with_equivalence_properties(join_eq_properties))
-}
-
-/// Calculate ordering equivalence properties for the given join operation.
-pub fn combine_join_ordering_equivalence_properties(
-    join_type: &JoinType,
-    left: &Arc<dyn ExecutionPlan>,
-    right: &Arc<dyn ExecutionPlan>,
-    schema: SchemaRef,
-    maintains_input_order: &[bool],
-    probe_side: Option<JoinSide>,
-    join_eq_properties: EquivalenceProperties,
-) -> Result<OrderingEquivalenceProperties> {
-    let mut new_properties = OrderingEquivalenceProperties::new(schema);
-    let left_columns_len = left.schema().fields.len();
-    let left_oeq_properties = left.ordering_equivalence_properties();
-    let right_oeq_properties = right.ordering_equivalence_properties();
-    // All joins have 2 children
-    assert_eq!(maintains_input_order.len(), 2);
-    let left_maintains = maintains_input_order[0];
-    let right_maintains = maintains_input_order[1];
-    match (left_maintains, right_maintains) {
-        (true, true) => {
-            return Err(DataFusionError::Plan(
-                "Cannot maintain ordering of both sides".to_string(),
-            ))
-        }
-        (true, false) => {
-            new_properties.extend(left_oeq_properties.oeq_class().cloned());
-            // In this special case, right side ordering can be prefixed with left side ordering.
-            if let (
-                Some(JoinSide::Left),
-                // right side have an ordering
-                Some(_),
-                JoinType::Inner,
-                Some(oeq_class),
-            ) = (
-                probe_side,
-                right.output_ordering(),
-                join_type,
-                right_oeq_properties.oeq_class(),
-            ) {
-                let left_output_ordering = left.output_ordering().unwrap_or(&[]);
-
-                let updated_right_oeq = get_updated_right_ordering_equivalent_class(
-                    join_type,
-                    oeq_class,
-                    left_columns_len,
-                    &join_eq_properties,
-                )?;
-
-                // Right side ordering equivalence properties should be prepended with
-                // those of the left side while constructing output ordering equivalence
-                // properties since stream side is the left side.
-                //
-                // If the right table ordering equivalences contain `b ASC`, and the output
-                // ordering of the left table is `a ASC`, then the ordering equivalence `b ASC`
-                // for the right table should be converted to `a ASC, b ASC` before it is added
-                // to the ordering equivalences of the join.
-                let updated_right_oeq_class = updated_right_oeq
-                    .prefix_ordering_equivalent_class_with_existing_ordering(
-                        left_output_ordering,
-                        &join_eq_properties,
-                    );
-                new_properties.extend(Some(updated_right_oeq_class));
-            }
-        }
-        (false, true) => {
-            let updated_right_oeq = right_oeq_properties
-                .oeq_class()
-                .map(|right_oeq_class| {
-                    get_updated_right_ordering_equivalent_class(
-                        join_type,
-                        right_oeq_class,
-                        left_columns_len,
-                        &join_eq_properties,
-                    )
-                })
-                .transpose()?;
-            new_properties.extend(updated_right_oeq);
-            // In this special case, left side ordering can be prefixed with right side ordering.
-            if let (
-                Some(JoinSide::Right),
-                // left side have an ordering
-                Some(_),
-                JoinType::Inner,
-                Some(left_oeq_class),
-            ) = (
-                probe_side,
-                left.output_ordering(),
-                join_type,
-                left_oeq_properties.oeq_class(),
-            ) {
-                let right_output_ordering = right.output_ordering().unwrap_or(&[]);
-                let right_output_ordering =
-                    add_offset_to_lex_ordering(right_output_ordering, left_columns_len)?;
-
-                // Left side ordering equivalence properties should be prepended with
-                // those of the right side while constructing output ordering equivalence
-                // properties since stream side is the right side.
-                //
-                // If the right table ordering equivalences contain `b ASC`, and the output
-                // ordering of the left table is `a ASC`, then the ordering equivalence `b ASC`
-                // for the right table should be converted to `a ASC, b ASC` before it is added
-                // to the ordering equivalences of the join.
-                let updated_left_oeq_class = left_oeq_class
-                    .prefix_ordering_equivalent_class_with_existing_ordering(
-                        &right_output_ordering,
-                        &join_eq_properties,
-                    );
-                new_properties.extend(Some(updated_left_oeq_class));
-            }
-        }
-        (false, false) => {}
-    }
-    Ok(new_properties)
-}
-
-impl Display for JoinSide {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JoinSide::Left => write!(f, "left"),
-            JoinSide::Right => write!(f, "right"),
-        }
-    }
-}
-
-/// Used in ColumnIndex to distinguish which side the index is for
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum JoinSide {
-    /// Left side of the join
-    Left,
-    /// Right side of the join
-    Right,
-}
-
-impl JoinSide {
-    /// Inverse the join side
-    pub fn negate(&self) -> Self {
-        match self {
-            JoinSide::Left => JoinSide::Right,
-            JoinSide::Right => JoinSide::Left,
-        }
-    }
+    (!output_ordering.is_empty()).then_some(output_ordering)
 }
 
 /// Information about the index and placement (left or right) of the columns
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnIndex {
     /// Index of the column
     pub index: usize,
@@ -726,21 +457,21 @@ pub(crate) fn estimate_join_statistics(
     right: Arc<dyn ExecutionPlan>,
     on: JoinOn,
     join_type: &JoinType,
-) -> Statistics {
-    let left_stats = left.statistics();
-    let right_stats = right.statistics();
+    schema: &Schema,
+) -> Result<Statistics> {
+    let left_stats = left.statistics()?;
+    let right_stats = right.statistics()?;
 
     let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, &on);
     let (num_rows, column_statistics) = match join_stats {
-        Some(stats) => (Some(stats.num_rows), Some(stats.column_statistics)),
-        None => (None, None),
+        Some(stats) => (Precision::Inexact(stats.num_rows), stats.column_statistics),
+        None => (Precision::Absent, Statistics::unknown_column(schema)),
     };
-    Statistics {
+    Ok(Statistics {
         num_rows,
-        total_byte_size: None,
+        total_byte_size: Precision::Absent,
         column_statistics,
-        is_exact: false,
-    }
+    })
 }
 
 // Estimate the cardinality for the given join with input statistics.
@@ -752,29 +483,27 @@ fn estimate_join_cardinality(
 ) -> Option<PartialJoinStatistics> {
     match join_type {
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-            let left_num_rows = left_stats.num_rows?;
-            let right_num_rows = right_stats.num_rows?;
-
-            // Take the left_col_stats and right_col_stats using the index
-            // obtained from index() method of the each element of 'on'.
-            let all_left_col_stats = left_stats.column_statistics?;
-            let all_right_col_stats = right_stats.column_statistics?;
             let (left_col_stats, right_col_stats) = on
                 .iter()
                 .map(|(left, right)| {
                     (
-                        all_left_col_stats[left.index()].clone(),
-                        all_right_col_stats[right.index()].clone(),
+                        left_stats.column_statistics[left.index()].clone(),
+                        right_stats.column_statistics[right.index()].clone(),
                     )
                 })
                 .unzip::<_, _, Vec<_>, Vec<_>>();
 
             let ij_cardinality = estimate_inner_join_cardinality(
-                left_num_rows,
-                right_num_rows,
-                left_col_stats,
-                right_col_stats,
-                left_stats.is_exact && right_stats.is_exact,
+                Statistics {
+                    num_rows: left_stats.num_rows.clone(),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: left_col_stats,
+                },
+                Statistics {
+                    num_rows: right_stats.num_rows.clone(),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: right_col_stats,
+                },
             )?;
 
             // The cardinality for inner join can also be used to estimate
@@ -783,25 +512,25 @@ fn estimate_join_cardinality(
             // joins (so that we don't underestimate the cardinality).
             let cardinality = match join_type {
                 JoinType::Inner => ij_cardinality,
-                JoinType::Left => max(ij_cardinality, left_num_rows),
-                JoinType::Right => max(ij_cardinality, right_num_rows),
-                JoinType::Full => {
-                    max(ij_cardinality, left_num_rows)
-                        + max(ij_cardinality, right_num_rows)
-                        - ij_cardinality
-                }
+                JoinType::Left => ij_cardinality.max(&left_stats.num_rows),
+                JoinType::Right => ij_cardinality.max(&right_stats.num_rows),
+                JoinType::Full => ij_cardinality
+                    .max(&left_stats.num_rows)
+                    .add(&ij_cardinality.max(&right_stats.num_rows))
+                    .sub(&ij_cardinality),
                 _ => unreachable!(),
             };
 
             Some(PartialJoinStatistics {
-                num_rows: cardinality,
+                num_rows: *cardinality.get_value()?,
                 // We don't do anything specific here, just combine the existing
                 // statistics which might yield subpar results (although it is
                 // true, esp regarding min/max). For a better estimation, we need
                 // filter selectivity analysis first.
-                column_statistics: all_left_col_stats
+                column_statistics: left_stats
+                    .column_statistics
                     .into_iter()
-                    .chain(all_right_col_stats)
+                    .chain(right_stats.column_statistics)
                     .collect(),
             })
         }
@@ -818,30 +547,47 @@ fn estimate_join_cardinality(
 /// a very conservative implementation that can quickly give up if there is not
 /// enough input statistics.
 fn estimate_inner_join_cardinality(
-    left_num_rows: usize,
-    right_num_rows: usize,
-    left_col_stats: Vec<ColumnStatistics>,
-    right_col_stats: Vec<ColumnStatistics>,
-    is_exact: bool,
-) -> Option<usize> {
+    left_stats: Statistics,
+    right_stats: Statistics,
+) -> Option<Precision<usize>> {
     // The algorithm here is partly based on the non-histogram selectivity estimation
     // from Spark's Catalyst optimizer.
-
-    let mut join_selectivity = None;
-    for (left_stat, right_stat) in left_col_stats.iter().zip(right_col_stats.iter()) {
-        if (left_stat.min_value.clone()? > right_stat.max_value.clone()?)
-            || (left_stat.max_value.clone()? < right_stat.min_value.clone()?)
-        {
-            // If there is no overlap in any of the join columns, that means the join
-            // itself is disjoint and the cardinality is 0. Though we can only assume
-            // this when the statistics are exact (since it is a very strong assumption).
-            return if is_exact { Some(0) } else { None };
+    let mut join_selectivity = Precision::Absent;
+    for (left_stat, right_stat) in left_stats
+        .column_statistics
+        .iter()
+        .zip(right_stats.column_statistics.iter())
+    {
+        // If there is no overlap in any of the join columns, this means the join
+        // itself is disjoint and the cardinality is 0. Though we can only assume
+        // this when the statistics are exact (since it is a very strong assumption).
+        if left_stat.min_value.get_value()? > right_stat.max_value.get_value()? {
+            return Some(
+                if left_stat.min_value.is_exact().unwrap_or(false)
+                    && right_stat.max_value.is_exact().unwrap_or(false)
+                {
+                    Precision::Exact(0)
+                } else {
+                    Precision::Inexact(0)
+                },
+            );
+        }
+        if left_stat.max_value.get_value()? < right_stat.min_value.get_value()? {
+            return Some(
+                if left_stat.max_value.is_exact().unwrap_or(false)
+                    && right_stat.min_value.is_exact().unwrap_or(false)
+                {
+                    Precision::Exact(0)
+                } else {
+                    Precision::Inexact(0)
+                },
+            );
         }
 
-        let left_max_distinct = max_distinct_count(left_num_rows, left_stat.clone());
-        let right_max_distinct = max_distinct_count(right_num_rows, right_stat.clone());
-        let max_distinct = max(left_max_distinct, right_max_distinct);
-        if max_distinct > join_selectivity {
+        let left_max_distinct = max_distinct_count(&left_stats.num_rows, left_stat)?;
+        let right_max_distinct = max_distinct_count(&right_stats.num_rows, right_stat)?;
+        let max_distinct = left_max_distinct.max(&right_max_distinct);
+        if max_distinct.get_value().is_some() {
             // Seems like there are a few implementations of this algorithm that implement
             // exponential decay for the selectivity (like Hive's Optiq Optimizer). Needs
             // further exploration.
@@ -852,9 +598,14 @@ fn estimate_inner_join_cardinality(
     // With the assumption that the smaller input's domain is generally represented in the bigger
     // input's domain, we can estimate the inner join's cardinality by taking the cartesian product
     // of the two inputs and normalizing it by the selectivity factor.
+    let left_num_rows = left_stats.num_rows.get_value()?;
+    let right_num_rows = right_stats.num_rows.get_value()?;
     match join_selectivity {
-        Some(selectivity) if selectivity > 0 => {
-            Some((left_num_rows * right_num_rows) / selectivity)
+        Precision::Exact(value) if value > 0 => {
+            Some(Precision::Exact((left_num_rows * right_num_rows) / value))
+        }
+        Precision::Inexact(value) if value > 0 => {
+            Some(Precision::Inexact((left_num_rows * right_num_rows) / value))
         }
         // Since we don't have any information about the selectivity (which is derived
         // from the number of distinct rows information) we can give up here for now.
@@ -870,42 +621,44 @@ fn estimate_inner_join_cardinality(
 /// If distinct_count is available, uses it directly. If the column numeric, and
 /// has min/max values, then they might be used as a fallback option. Otherwise,
 /// returns None.
-fn max_distinct_count(num_rows: usize, stats: ColumnStatistics) -> Option<usize> {
-    match (stats.distinct_count, stats.max_value, stats.min_value) {
-        (Some(_), _, _) => stats.distinct_count,
+fn max_distinct_count(
+    num_rows: &Precision<usize>,
+    stats: &ColumnStatistics,
+) -> Option<Precision<usize>> {
+    match (
+        &stats.distinct_count,
+        stats.max_value.get_value(),
+        stats.min_value.get_value(),
+    ) {
+        (Precision::Exact(_), _, _) | (Precision::Inexact(_), _, _) => {
+            Some(stats.distinct_count.clone())
+        }
         (_, Some(max), Some(min)) => {
-            // Note that float support is intentionally omitted here, since the computation
-            // of a range between two float values is not trivial and the result would be
-            // highly inaccurate.
-            let numeric_range = get_int_range(min, max)?;
+            let numeric_range = Interval::new(
+                IntervalBound::new(min.clone(), false),
+                IntervalBound::new(max.clone(), false),
+            )
+            .cardinality()
+            .ok()
+            .flatten()? as usize;
 
             // The number can never be greater than the number of rows we have (minus
             // the nulls, since they don't count as distinct values).
-            let ceiling = num_rows - stats.null_count.unwrap_or(0);
-            Some(numeric_range.min(ceiling))
+            let ceiling =
+                num_rows.get_value()? - stats.null_count.get_value().unwrap_or(&0);
+            Some(
+                if num_rows.is_exact().unwrap_or(false)
+                    && stats.max_value.is_exact().unwrap_or(false)
+                    && stats.min_value.is_exact().unwrap_or(false)
+                {
+                    Precision::Exact(numeric_range.min(ceiling))
+                } else {
+                    Precision::Inexact(numeric_range.min(ceiling))
+                },
+            )
         }
         _ => None,
     }
-}
-
-/// Return the numeric range between the given min and max values.
-fn get_int_range(min: ScalarValue, max: ScalarValue) -> Option<usize> {
-    let delta = &max.sub(&min).ok()?;
-    match delta {
-        ScalarValue::Int8(Some(delta)) if *delta >= 0 => Some(*delta as usize),
-        ScalarValue::Int16(Some(delta)) if *delta >= 0 => Some(*delta as usize),
-        ScalarValue::Int32(Some(delta)) if *delta >= 0 => Some(*delta as usize),
-        ScalarValue::Int64(Some(delta)) if *delta >= 0 => Some(*delta as usize),
-        ScalarValue::UInt8(Some(delta)) => Some(*delta as usize),
-        ScalarValue::UInt16(Some(delta)) => Some(*delta as usize),
-        ScalarValue::UInt32(Some(delta)) => Some(*delta as usize),
-        ScalarValue::UInt64(Some(delta)) => Some(*delta as usize),
-        _ => None,
-    }
-    // The delta (directly) is not the real range, since it does not include the
-    // first term.
-    // E.g. (min=2, max=4) -> (4 - 2) -> 2, but the actual result should be 3 (1, 2, 3).
-    .map(|open_ended_range| open_ended_range + 1)
 }
 
 enum OnceFutState<T> {
@@ -1025,7 +778,7 @@ pub(crate) fn apply_join_filter_to_indices(
     let filter_result = filter
         .expression()
         .evaluate(&intermediate_batch)?
-        .into_array(intermediate_batch.num_rows());
+        .into_array(intermediate_batch.num_rows())?;
     let mask = as_boolean_array(&filter_result)?;
 
     let left_filtered = compute::filter(&build_indices, mask)?;
@@ -1345,8 +1098,7 @@ pub fn prepare_sorted_exprs(
     right_sort_exprs: &[PhysicalSortExpr],
 ) -> Result<(SortedFilterExpr, SortedFilterExpr, ExprIntervalGraph)> {
     // Build the filter order for the left side
-    let err =
-        || DataFusionError::Plan("Filter does not include the child order".to_owned());
+    let err = || plan_datafusion_err!("Filter does not include the child order");
 
     let left_temp_sorted_filter_expr = build_filter_input_order(
         JoinSide::Left,
@@ -1384,13 +1136,15 @@ pub fn prepare_sorted_exprs(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow::datatypes::Fields;
-    use arrow::error::Result as ArrowResult;
-    use arrow::{datatypes::DataType, error::ArrowError};
-    use arrow_schema::SortOptions;
-    use datafusion_common::ScalarValue;
     use std::pin::Pin;
+
+    use super::*;
+
+    use arrow::datatypes::{DataType, Fields};
+    use arrow::error::{ArrowError, Result as ArrowResult};
+    use arrow_schema::SortOptions;
+
+    use datafusion_common::ScalarValue;
 
     fn check(left: &[Column], right: &[Column], on: &[(Column, Column)]) -> Result<()> {
         let left = left
@@ -1543,14 +1297,18 @@ mod tests {
 
     fn create_stats(
         num_rows: Option<usize>,
-        column_stats: Option<Vec<ColumnStatistics>>,
+        column_stats: Vec<ColumnStatistics>,
         is_exact: bool,
     ) -> Statistics {
         Statistics {
-            num_rows,
+            num_rows: if is_exact {
+                num_rows.map(Precision::Exact)
+            } else {
+                num_rows.map(Precision::Inexact)
+            }
+            .unwrap_or(Precision::Absent),
             column_statistics: column_stats,
-            is_exact,
-            ..Default::default()
+            total_byte_size: Precision::Absent,
         }
     }
 
@@ -1560,9 +1318,15 @@ mod tests {
         distinct_count: Option<usize>,
     ) -> ColumnStatistics {
         ColumnStatistics {
-            distinct_count,
-            min_value: min.map(|size| ScalarValue::Int64(Some(size))),
-            max_value: max.map(|size| ScalarValue::Int64(Some(size))),
+            distinct_count: distinct_count
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent),
+            min_value: min
+                .map(|size| Precision::Inexact(ScalarValue::from(size)))
+                .unwrap_or(Precision::Absent),
+            max_value: max
+                .map(|size| Precision::Inexact(ScalarValue::from(size)))
+                .unwrap_or(Precision::Absent),
             ..Default::default()
         }
     }
@@ -1574,7 +1338,7 @@ mod tests {
     // over the expected output (since it depends on join type to join type).
     #[test]
     fn test_inner_join_cardinality_single_column() -> Result<()> {
-        let cases: Vec<(PartialStats, PartialStats, Option<usize>)> = vec![
+        let cases: Vec<(PartialStats, PartialStats, Option<Precision<usize>>)> = vec![
             // -----------------------------------------------------------------------------
             // | left(rows, min, max, distinct), right(rows, min, max, distinct), expected |
             // -----------------------------------------------------------------------------
@@ -1586,70 +1350,70 @@ mod tests {
             (
                 (10, Some(1), Some(10), None),
                 (10, Some(1), Some(10), None),
-                Some(10),
+                Some(Precision::Inexact(10)),
             ),
             // range(left) > range(right)
             (
                 (10, Some(6), Some(10), None),
                 (10, Some(8), Some(10), None),
-                Some(20),
+                Some(Precision::Inexact(20)),
             ),
             // range(right) > range(left)
             (
                 (10, Some(8), Some(10), None),
                 (10, Some(6), Some(10), None),
-                Some(20),
+                Some(Precision::Inexact(20)),
             ),
             // range(left) > len(left), range(right) > len(right)
             (
                 (10, Some(1), Some(15), None),
                 (20, Some(1), Some(40), None),
-                Some(10),
+                Some(Precision::Inexact(10)),
             ),
             // When we have distinct count.
             (
                 (10, Some(1), Some(10), Some(10)),
                 (10, Some(1), Some(10), Some(10)),
-                Some(10),
+                Some(Precision::Inexact(10)),
             ),
             // distinct(left) > distinct(right)
             (
                 (10, Some(1), Some(10), Some(5)),
                 (10, Some(1), Some(10), Some(2)),
-                Some(20),
+                Some(Precision::Inexact(20)),
             ),
             // distinct(right) > distinct(left)
             (
                 (10, Some(1), Some(10), Some(2)),
                 (10, Some(1), Some(10), Some(5)),
-                Some(20),
+                Some(Precision::Inexact(20)),
             ),
             // min(left) < 0 (range(left) > range(right))
             (
                 (10, Some(-5), Some(5), None),
                 (10, Some(1), Some(5), None),
-                Some(10),
+                Some(Precision::Inexact(10)),
             ),
             // min(right) < 0, max(right) < 0 (range(right) > range(left))
             (
                 (10, Some(-25), Some(-20), None),
                 (10, Some(-25), Some(-15), None),
-                Some(10),
+                Some(Precision::Inexact(10)),
             ),
             // range(left) < 0, range(right) >= 0
             // (there isn't a case where both left and right ranges are negative
             //  so one of them is always going to work, this just proves negative
             //  ranges with bigger absolute values are not are not accidentally used).
             (
-                (10, Some(10), Some(0), None),
+                (10, Some(-10), Some(0), None),
                 (10, Some(0), Some(10), Some(5)),
-                Some(20), // It would have been ten if we have used abs(range(left))
+                Some(Precision::Inexact(10)),
             ),
             // range(left) = 1, range(right) = 1
             (
                 (10, Some(1), Some(1), None),
                 (10, Some(1), Some(1), None),
-                Some(100),
+                Some(Precision::Inexact(100)),
             ),
             //
             // Edge cases
@@ -1674,22 +1438,12 @@ mod tests {
             (
                 (10, Some(0), Some(10), None),
                 (10, Some(11), Some(20), None),
-                None,
+                Some(Precision::Inexact(0)),
             ),
             (
                 (10, Some(11), Some(20), None),
                 (10, Some(0), Some(10), None),
-                None,
-            ),
-            (
-                (10, Some(5), Some(10), Some(10)),
-                (10, Some(11), Some(3), Some(10)),
-                None,
-            ),
-            (
-                (10, Some(10), Some(5), Some(10)),
-                (10, Some(3), Some(7), Some(10)),
-                None,
+                Some(Precision::Inexact(0)),
             ),
             // distinct(left) = 0, distinct(right) = 0
             (
@@ -1713,13 +1467,18 @@ mod tests {
 
             assert_eq!(
                 estimate_inner_join_cardinality(
-                    left_num_rows,
-                    right_num_rows,
-                    left_col_stats.clone(),
-                    right_col_stats.clone(),
-                    false,
+                    Statistics {
+                        num_rows: Precision::Inexact(left_num_rows),
+                        total_byte_size: Precision::Absent,
+                        column_statistics: left_col_stats.clone(),
+                    },
+                    Statistics {
+                        num_rows: Precision::Inexact(right_num_rows),
+                        total_byte_size: Precision::Absent,
+                        column_statistics: right_col_stats.clone(),
+                    },
                 ),
-                expected_cardinality
+                expected_cardinality.clone()
             );
 
             // We should also be able to use join_cardinality to get the same results
@@ -1727,18 +1486,22 @@ mod tests {
             let join_on = vec![(Column::new("a", 0), Column::new("b", 0))];
             let partial_join_stats = estimate_join_cardinality(
                 &join_type,
-                create_stats(Some(left_num_rows), Some(left_col_stats.clone()), false),
-                create_stats(Some(right_num_rows), Some(right_col_stats.clone()), false),
+                create_stats(Some(left_num_rows), left_col_stats.clone(), false),
+                create_stats(Some(right_num_rows), right_col_stats.clone(), false),
                 &join_on,
             );
 
             assert_eq!(
-                partial_join_stats.clone().map(|s| s.num_rows),
-                expected_cardinality
+                partial_join_stats
+                    .clone()
+                    .map(|s| Precision::Inexact(s.num_rows)),
+                expected_cardinality.clone()
             );
             assert_eq!(
                 partial_join_stats.map(|s| s.column_statistics),
-                expected_cardinality.map(|_| [left_col_stats, right_col_stats].concat())
+                expected_cardinality
+                    .clone()
+                    .map(|_| [left_col_stats, right_col_stats].concat())
             );
         }
         Ok(())
@@ -1760,13 +1523,18 @@ mod tests {
         // count is 200, so we are going to pick it.
         assert_eq!(
             estimate_inner_join_cardinality(
-                400,
-                400,
-                left_col_stats,
-                right_col_stats,
-                false
+                Statistics {
+                    num_rows: Precision::Inexact(400),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: left_col_stats,
+                },
+                Statistics {
+                    num_rows: Precision::Inexact(400),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: right_col_stats,
+                },
             ),
-            Some((400 * 400) / 200)
+            Some(Precision::Inexact((400 * 400) / 200))
         );
         Ok(())
     }
@@ -1774,26 +1542,31 @@ mod tests {
     #[test]
     fn test_inner_join_cardinality_decimal_range() -> Result<()> {
         let left_col_stats = vec![ColumnStatistics {
-            distinct_count: None,
-            min_value: Some(ScalarValue::Decimal128(Some(32500), 14, 4)),
-            max_value: Some(ScalarValue::Decimal128(Some(35000), 14, 4)),
+            distinct_count: Precision::Absent,
+            min_value: Precision::Inexact(ScalarValue::Decimal128(Some(32500), 14, 4)),
+            max_value: Precision::Inexact(ScalarValue::Decimal128(Some(35000), 14, 4)),
             ..Default::default()
         }];
 
         let right_col_stats = vec![ColumnStatistics {
-            distinct_count: None,
-            min_value: Some(ScalarValue::Decimal128(Some(33500), 14, 4)),
-            max_value: Some(ScalarValue::Decimal128(Some(34000), 14, 4)),
+            distinct_count: Precision::Absent,
+            min_value: Precision::Inexact(ScalarValue::Decimal128(Some(33500), 14, 4)),
+            max_value: Precision::Inexact(ScalarValue::Decimal128(Some(34000), 14, 4)),
             ..Default::default()
         }];
 
         assert_eq!(
             estimate_inner_join_cardinality(
-                100,
-                100,
-                left_col_stats,
-                right_col_stats,
-                false
+                Statistics {
+                    num_rows: Precision::Inexact(100),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: left_col_stats,
+                },
+                Statistics {
+                    num_rows: Precision::Inexact(100),
+                    total_byte_size: Precision::Absent,
+                    column_statistics: right_col_stats,
+                },
             ),
             None
         );
@@ -1840,8 +1613,8 @@ mod tests {
 
             let partial_join_stats = estimate_join_cardinality(
                 &join_type,
-                create_stats(Some(1000), Some(left_col_stats.clone()), false),
-                create_stats(Some(2000), Some(right_col_stats.clone()), false),
+                create_stats(Some(1000), left_col_stats.clone(), false),
+                create_stats(Some(2000), right_col_stats.clone(), false),
                 &join_on,
             )
             .unwrap();
@@ -1905,8 +1678,8 @@ mod tests {
         for (join_type, expected_num_rows) in cases {
             let partial_join_stats = estimate_join_cardinality(
                 &join_type,
-                create_stats(Some(1000), Some(left_col_stats.clone()), true),
-                create_stats(Some(2000), Some(right_col_stats.clone()), true),
+                create_stats(Some(1000), left_col_stats.clone(), true),
+                create_stats(Some(2000), right_col_stats.clone(), true),
                 &join_on,
             )
             .unwrap();
@@ -1916,84 +1689,6 @@ mod tests {
                 [left_col_stats.clone(), right_col_stats.clone()].concat()
             );
         }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_updated_right_ordering_equivalence_properties() -> Result<()> {
-        let join_type = JoinType::Inner;
-
-        let options = SortOptions::default();
-        let right_oeq_class = OrderingEquivalentClass::new(
-            vec![
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("x", 0)),
-                    options,
-                },
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("y", 1)),
-                    options,
-                },
-            ],
-            vec![vec![
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("z", 2)),
-                    options,
-                },
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("w", 3)),
-                    options,
-                },
-            ]],
-        );
-
-        let left_columns_len = 4;
-
-        let fields: Fields = ["a", "b", "c", "d", "x", "y", "z", "w"]
-            .into_iter()
-            .map(|name| Field::new(name, DataType::Int32, true))
-            .collect();
-
-        let mut join_eq_properties =
-            EquivalenceProperties::new(Arc::new(Schema::new(fields)));
-        join_eq_properties
-            .add_equal_conditions((&Column::new("a", 0), &Column::new("x", 4)));
-        join_eq_properties
-            .add_equal_conditions((&Column::new("d", 3), &Column::new("w", 7)));
-
-        let result = get_updated_right_ordering_equivalent_class(
-            &join_type,
-            &right_oeq_class,
-            left_columns_len,
-            &join_eq_properties,
-        )?;
-
-        let expected = OrderingEquivalentClass::new(
-            vec![
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("a", 0)),
-                    options,
-                },
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("y", 5)),
-                    options,
-                },
-            ],
-            vec![vec![
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("z", 6)),
-                    options,
-                },
-                PhysicalSortExpr {
-                    expr: Arc::new(Column::new("d", 3)),
-                    options,
-                },
-            ]],
-        );
-
-        assert_eq!(result.head(), expected.head());
-        assert_eq!(result.others(), expected.others());
 
         Ok(())
     }
@@ -2090,7 +1785,7 @@ mod tests {
                     left_columns_len,
                     maintains_input_order,
                     probe_side
-                )?,
+                ),
                 expected[i]
             );
         }
